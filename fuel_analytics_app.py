@@ -877,15 +877,19 @@ def main():
         else:
             colormap = {"critical": "#7A0010", "low": "#E23744", "watch": "#C5821C",
                         "healthy": "#1F9D57", "no estimate": "rgba(140,140,140,.55)"}
-            plotr = runway.dropna(subset=["days_to_run_out"]).iloc[::-1]
+            plotr = runway.dropna(subset=["days_to_run_out"])
             if not plotr.empty:
+                # most-urgent (shortest cover) on top
+                order = list(plotr.sort_values("days_to_run_out", ascending=False)["station"])
                 fig = px.bar(plotr, x="days_to_run_out", y="station", orientation="h",
                              color="risk", color_discrete_map=colormap,
+                             category_orders={"station": order},
                              labels={"days_to_run_out": "Days of cover", "station": "", "risk": ""},
                              title="Stock cover by station (label = days)")
-                fig.update_traces(text=[f"{d:.1f}" for d in plotr["days_to_run_out"]],
-                                  textposition="outside", textfont=dict(color=INK, size=11),
-                                  cliponaxis=False)
+                # colouring by risk splits the data into one series per risk, so a single
+                # broadcast text list would mis-map. texttemplate reads each bar's own x value.
+                fig.update_traces(texttemplate="%{x:.1f}", textposition="outside",
+                                  textfont=dict(color=INK, size=11), cliponaxis=False)
                 fig.add_vline(x=3, line_dash="dot", line_color=INK, annotation_text="3-day floor")
                 st.plotly_chart(style_fig(fig, max(280, 36 * len(plotr)), accent),
                                 use_container_width=True)
