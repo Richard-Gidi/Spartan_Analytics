@@ -1,27 +1,22 @@
 """
 Spartan Fuel — Petroleum Marketing Analytics
 =============================================
-Reads the MASTER sheet of a Google Sheet (link supplied via a .env variable
-called GOOGLE) and produces a marketing-analytics workbench for a fuel-retail
-network. PMS = petrol (red), AGO = diesel (green). Works in light & dark theme.
+Reads the MASTER sheet of a Google Sheet (link in a .env variable GOOGLE) and
+builds a marketing-analytics workbench for a fuel-retail network.
+PMS = petrol (red), AGO = diesel (green), Both = combined throughput.
+Light & dark theme, phone-friendly.
 
 Setup
 -----
-1) Create  .env  next to this script:
-       GOOGLE=https://docs.google.com/spreadsheets/d/<your-id>/edit?usp=sharing
-   Sharing must be "Anyone with the link – Viewer".
-2) pip install -r requirements.txt
-   streamlit run fuel_analytics_app.py
+  .env  ->  GOOGLE=https://docs.google.com/spreadsheets/d/<id>/edit?usp=sharing
+            (Share -> Anyone with the link – Viewer)
+  pip install -r requirements.txt
+  streamlit run fuel_analytics_app.py
 
-Target definition
------------------
-For each station: sum volume in EACH baseline month -> take the MEDIAN of those
-monthly totals -> the monthly target is TWICE that median. The actual total sold
-in the current month is compared to that target (gauge = % of target obtained).
-
-Only the MASTER tab is used. The target has its own date window; no other view
-exposes a date control. RUNWAY_WINDOW / PRICE_EVENT_WINDOW / ranking weights are
-fixed in code below.
+Target  = 2 × median of the baseline MONTHLY totals, measured against the actual
+          total sold in the current period (gauge = % of target obtained).
+Only the MASTER tab is used. The target has its own date window. The values
+below are fixed in code, not shown in the UI.
 """
 
 import io
@@ -41,15 +36,17 @@ RANK_W_ATTAIN      = 0.40
 RANK_W_VOLUME      = 0.35
 RANK_W_DISCIPLINE  = 0.25
 EXCLUDE_ZERO       = True
+STANDARD = {"PMS": 0.32, "AGO": 0.25}            # allowable stock-loss % of throughput
 
-PCOL  = {"PMS": "#E23744", "AGO": "#1F9D57"}                # PMS red, AGO green (read well on both themes)
-PSTEP = {"PMS": "rgba(226,55,68,.22)", "AGO": "rgba(31,157,87,.22)"}
-PLABEL = {"PMS": "PMS · Petrol", "AGO": "AGO · Diesel"}
+PCOL  = {"PMS": "#E23744", "AGO": "#1F9D57", "BOTH": "#3A6EA5"}
+PSTEP = {"PMS": "rgba(226,55,68,.22)", "AGO": "rgba(31,157,87,.22)", "BOTH": "rgba(58,110,165,.22)"}
+PLABEL = {"PMS": "PMS · Petrol", "AGO": "AGO · Diesel", "BOTH": "PMS + AGO (combined)"}
 SCALE = {"PMS": [[0, "rgba(226,55,68,.06)"], [1, "#E23744"]],
-         "AGO": [[0, "rgba(31,157,87,.06)"], [1, "#1F9D57"]]}
+         "AGO": [[0, "rgba(31,157,87,.06)"], [1, "#1F9D57"]],
+         "BOTH": [[0, "rgba(58,110,165,.06)"], [1, "#3A6EA5"]]}
 GRID = "rgba(140,140,140,.16)"
 AXIS = "rgba(140,140,140,.30)"
-INK  = "#8b9096"          # neutral text that reads on light AND dark
+INK  = "#8b9096"
 
 
 # ───────────────────────────────── parsing ─────────────────────────────────
@@ -163,6 +160,22 @@ def build_records(rows):
     return df
 
 
+def with_combined(df):
+    """Append a synthetic 'BOTH' product = PMS + AGO summed per station/date."""
+    if df.empty:
+        return df
+    sm = lambda s: s.sum(min_count=1)
+    g = (df.groupby(["station", "date"], as_index=False)
+           .agg(volume=("volume", sm), closing=("closing", sm), dip=("dip", sm),
+                dip_var=("dip_var", sm), shortage=("shortage", sm),
+                discharge=("discharge", sm)))
+    g["product"] = "BOTH"
+    g["price"] = np.nan
+    g = g[df.columns]
+    out = pd.concat([df, g], ignore_index=True)
+    return out.sort_values(["station", "product", "date"]).reset_index(drop=True)
+
+
 # ──────────────────────────── google sheet loader ──────────────────────────
 def gsheet_export_url(link):
     m = re.search(r"/d/([a-zA-Z0-9-_]+)", link) or re.search(r"[?&]id=([a-zA-Z0-9-_]+)", link)
@@ -193,18 +206,14 @@ def _slice(df, product, start, end):
 
 
 def monthly_totals(frame):
-    """Sum volume by calendar month -> array of monthly totals."""
     v = frame.dropna(subset=["volume"])
     if v.empty:
         return np.array([])
-    g = v.groupby(v["date"].dt.to_period("M"))["volume"].sum()
-    return g.values.astype(float)
+    return v.groupby(v["date"].dt.to_period("M"))["volume"].sum().values.astype(float)
 
 
 def compute_targets(df, product, base_start, base_end, cur_start, cur_end,
                     exclude_zero=EXCLUDE_ZERO):
-    """Target = 2 × median of baseline MONTHLY totals. Compared to actual total
-    sold in the current period."""
     base = _slice(df, product, base_start, base_end)
     cur = _slice(df, product, cur_start, cur_end)
     out = []
@@ -289,7 +298,7 @@ def elast_brief(E):
                     "can win a lot of extra volume.")
         if a <= 0.9:
             return (f"Demand is **inelastic** ({E:.2f}). Customers barely change how much they buy "
-                    f"when the price moves (about {a:.1f}% volume change per 1% price change), so you "
+                    f"when price moves (about {a:.1f}% volume change per 1% price change), so you "
                     "have room to raise price without losing much volume — revenue tends to rise.")
         return (f"Demand is roughly **unit-elastic** ({E:.2f}): volume falls about 1% for every 1% "
                 "price increase, so total revenue stays broadly flat as price changes.")
@@ -342,8 +351,7 @@ def price_events(df, station, product, start, end,
             dP = (row["price"] - prev) / ((row["price"] + prev) / 2)
             arc = np.nan
             if not np.isnan(qb) and not np.isnan(qa) and (qa + qb) > 0:
-                dQ = (qa - qb) / ((qa + qb) / 2)
-                arc = dQ / dP if dP != 0 else np.nan
+                arc = ((qa - qb) / ((qa + qb) / 2)) / dP if dP != 0 else np.nan
             rows.append({"date": d, "old_price": prev, "new_price": row["price"],
                          "price_chg_pct": (row["price"] - prev) / prev * 100,
                          "avg_before": qb, "avg_after": qa,
@@ -380,7 +388,47 @@ def compute_runway(df, product, as_of, window=RUNWAY_WINDOW, exclude_zero=EXCLUD
     return res
 
 
-def compute_variance(df, product, targets_df, cur_start, cur_end):
+def compute_efficiency(df, product, exclude_zero=EXCLUDE_ZERO):
+    """How fast each station sells through stock: average days to stock out
+    (typical stock ÷ average daily sales), the empirical refill cycle (days
+    between deliveries), turnover, deliveries and stock-out days."""
+    out = []
+    for st in sorted(df["station"].unique()):
+        ss = df[(df["product"] == product) & (df["station"] == st)].sort_values("date")
+        if ss.empty:
+            continue
+        vols = ss["volume"].dropna()
+        sell = vols[vols > 0] if exclude_zero else vols
+        avg_daily = float(sell.mean()) if len(sell) else np.nan
+        stock_series = ss["dip"].where(ss["dip"].notna(), ss["closing"]).dropna()
+        avg_stock = float(stock_series.mean()) if len(stock_series) else np.nan
+        days_to_stockout = (avg_stock / avg_daily
+                            if (avg_daily and avg_daily > 0 and not np.isnan(avg_stock))
+                            else np.nan)
+        dq = ss[ss["discharge"].fillna(0) > 0]
+        deliveries = int(len(dq))
+        if deliveries >= 2:
+            gaps = dq["date"].sort_values().diff().dropna().dt.days
+            gaps = gaps[gaps > 0]
+            refill_cycle = float(gaps.mean()) if len(gaps) else np.nan
+        else:
+            refill_cycle = np.nan
+        span = (ss["date"].max() - ss["date"].min()).days + 1
+        refills_per_month = deliveries / max(span / 30.0, 1e-9) if deliveries else 0.0
+        stockout_days = int((vols == 0).sum())
+        turnover = (avg_daily / avg_stock if (avg_stock and avg_stock > 0
+                    and not np.isnan(avg_daily)) else np.nan)  # fraction of tank sold per day
+        out.append({"station": st, "avg_daily_sales": avg_daily, "avg_stock": avg_stock,
+                    "days_to_stockout": days_to_stockout, "refill_cycle_days": refill_cycle,
+                    "turnover_per_day": turnover, "deliveries": deliveries,
+                    "refills_per_month": refills_per_month, "stockout_days": stockout_days})
+    res = pd.DataFrame(out)
+    if not res.empty:
+        res = res.sort_values("days_to_stockout", na_position="last").reset_index(drop=True)
+    return res
+
+
+def compute_variance(df, product, targets_df, cur_start, cur_end, standard=None):
     cur = _slice(df, product, cur_start, cur_end)
     tmap = targets_df.set_index("station") if not targets_df.empty else None
     out = []
@@ -396,9 +444,14 @@ def compute_variance(df, product, targets_df, cur_start, cur_end):
             if tt and not np.isnan(tt) and tt != 0:
                 tgt_var_pct = tgt_var / tt * 100
         loss_pct = (dip_var / throughput * 100) if throughput else np.nan
+        abs_loss = abs(loss_pct) if not np.isnan(loss_pct) else np.nan
+        within = (abs_loss <= standard) if (standard is not None and not np.isnan(abs_loss)) else None
+        vs_std = (abs_loss - standard) if (standard is not None and not np.isnan(abs_loss)) else np.nan
         out.append({"station": st, "throughput": throughput,
                     "target_variance": tgt_var, "target_var_pct": tgt_var_pct,
                     "dip_variance": dip_var, "stock_loss_pct": loss_pct,
+                    "abs_loss_pct": abs_loss, "standard_pct": standard,
+                    "within_standard": within, "loss_vs_standard": vs_std,
                     "delivery_shortage": shortage})
     return pd.DataFrame(out)
 
@@ -434,28 +487,32 @@ def compute_rankings(targets_df, variance_df,
     return df.reset_index()
 
 
-def analyst_summary(product, targets_df, runway_df, rankings_df):
+def analyst_summary(plabel, targets_df, runway_df):
+    """Network read for the CURRENT period (target attainment basis)."""
     if targets_df.empty:
         return "No data in the selected windows."
     tot_a = targets_df["actual_total"].sum()
     tot_t = targets_df["monthly_target"].sum(skipna=True)
     overall = tot_a / tot_t * 100 if tot_t else np.nan
-    bits, pl = [], PLABEL[product]
+    bits = []
     if not np.isnan(overall):
         verdict = ("ahead of" if overall >= 100 else
                    "tracking toward" if overall >= 75 else "behind")
-        bits.append(f"Network {pl}: <b>{tot_a:,.0f} L</b> sold this period vs a monthly target of "
+        bits.append(f"Network {plabel}: <b>{tot_a:,.0f} L</b> sold this period vs a monthly target of "
                     f"<b>{tot_t:,.0f} L</b> — <b>{overall:.0f}%</b> obtained, {verdict} plan.")
-    if not rankings_df.empty:
-        bits.append(f"Top station: <b>{rankings_df.iloc[0]['station']}</b> · "
-                    f"weakest: <b>{rankings_df.iloc[-1]['station']}</b>.")
-    if not runway_df.empty:
+    valid = targets_df.dropna(subset=["attainment_pct"]).sort_values("attainment_pct", ascending=False)
+    if len(valid):
+        top, bot = valid.iloc[0], valid.iloc[-1]
+        bits.append(f"This period, best target attainment: <b>{top['station']}</b> "
+                    f"({top['attainment_pct']:.0f}%) · weakest: <b>{bot['station']}</b> "
+                    f"({bot['attainment_pct']:.0f}%).")
+    if runway_df is not None and not runway_df.empty:
         crit = runway_df[runway_df["risk"].isin(["critical", "low"])]
         if len(crit):
-            bits.append(f"⚠ <b>{len(crit)}</b> station(s) under ~3 days of cover "
+            bits.append(f"⚠ <b>{len(crit)}</b> tank(s) under ~3 days of cover "
                         f"({', '.join(crit['station'].head(4))}).")
         else:
-            bits.append("All stations hold healthy stock cover.")
+            bits.append("All tanks hold healthy stock cover.")
     return " ".join(bits)
 
 
@@ -485,7 +542,6 @@ html,body,[class*="css"]{font-family:'Inter',sans-serif;}
 h1,h2,h3,h4{font-family:'Sora',sans-serif;letter-spacing:-.01em;}
 .block-container{padding-top:1.1rem;padding-bottom:3rem;max-width:1280px;}
 section[data-testid="stSidebar"]{border-right:1px solid var(--line);}
-/* hero */
 .hero{background:linear-gradient(125deg,#11151B 0%,#222E37 100%);border-radius:20px;
       padding:24px 28px;color:#fff;box-shadow:0 16px 44px rgba(0,0,0,.22);margin-bottom:16px;}
 .hero h1{color:#fff;font-size:24px;margin:0 0 5px;font-weight:800;line-height:1.15;}
@@ -493,7 +549,6 @@ section[data-testid="stSidebar"]{border-right:1px solid var(--line);}
 .hero .badge{display:inline-block;background:rgba(255,255,255,.13);border:1px solid rgba(255,255,255,.22);
       color:#fff;border-radius:6px;padding:2px 9px;font-family:'IBM Plex Mono',monospace;
       font-size:11px;letter-spacing:.12em;margin-left:8px;vertical-align:middle;}
-/* summary + cards adapt to theme via translucent neutrals + inherited text */
 .summary{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--acc);
       border-radius:14px;padding:14px 18px;line-height:1.6;font-size:15px;margin-bottom:16px;color:inherit;}
 .kpi-row{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:2px 0 6px;}
@@ -512,15 +567,13 @@ section[data-testid="stSidebar"]{border-right:1px solid var(--line);}
 .stTabs [data-baseweb="tab"]{padding:8px 14px;border-radius:10px 10px 0 0;
       font-family:'Sora',sans-serif;font-weight:600;font-size:13px;}
 .stTabs [aria-selected="true"]{background:var(--acc);color:#fff!important;}
-[data-testid="stMetricValue"]{font-family:'IBM Plex Mono',monospace;}
 .note{color:var(--muted);font-size:12px;font-family:'IBM Plex Mono',monospace;}
-/* phone */
+.prodhead{font-family:'Sora',sans-serif;font-weight:700;font-size:16px;margin:10px 0 2px;
+      padding-left:10px;border-left:4px solid var(--acc2);}
 @media (max-width:820px){
   .kpi-row{grid-template-columns:repeat(2,1fr);}
-  .hero{padding:18px 18px;border-radius:16px;}
-  .hero h1{font-size:20px;}
-  .kpi .v{font-size:23px;}
-  .block-container{padding-left:.6rem;padding-right:.6rem;}
+  .hero{padding:18px 18px;border-radius:16px;} .hero h1{font-size:20px;}
+  .kpi .v{font-size:22px;} .block-container{padding-left:.6rem;padding-right:.6rem;}
 }
 @media (max-width:430px){ .kpi-row{grid-template-columns:1fr;} }
 </style>
@@ -558,9 +611,8 @@ def main():
     link = os.getenv("GOOGLE")
     if not link:
         st.title("⛽ Spartan Fuel — Marketing Analytics")
-        st.error("No data source found. Create a **.env** file with "
-                 "`GOOGLE=<your Google Sheets link>` and set sharing to "
-                 "*Anyone with the link – Viewer*.")
+        st.error("No data source. Create a **.env** with `GOOGLE=<Google Sheets link>` "
+                 "and set sharing to *Anyone with the link – Viewer*.")
         st.stop()
 
     @st.cache_data(ttl=600, show_spinner="Reading the MASTER sheet…")
@@ -577,14 +629,15 @@ def main():
         st.error("The MASTER sheet has no readable daily rows (need DATE and STATION columns).")
         st.stop()
 
+    df_all = with_combined(df)
     stations = sorted(df["station"].unique())
     dmin, dmax = df["date"].min(), df["date"].max()
     (bs_def, be_def), (cs_def, ce_def) = default_windows(dmin, dmax)
 
     with st.sidebar:
         st.markdown("#### View")
-        product = st.radio("Fuel grade", ["PMS", "AGO"],
-                           format_func=lambda p: PLABEL[p], horizontal=True)
+        product = st.radio("Fuel grade", ["PMS", "AGO", "BOTH"],
+                           format_func=lambda p: PLABEL[p])
         focus = st.selectbox("Station focus", ["All stations"] + stations)
         st.divider()
         st.markdown("#### Target window")
@@ -608,12 +661,14 @@ def main():
     base_s, base_e = rng(base, (bs_def, be_def))
     cur_s, cur_e = rng(cur, (cs_def, ce_def))
     accent = PCOL[product]
+    real_products = ["PMS", "AGO"] if product == "BOTH" else [product]
     st.markdown(f"<style>:root{{--acc:{accent};}}</style>", unsafe_allow_html=True)
 
-    targets = compute_targets(df, product, base_s, base_e, cur_s, cur_e)
-    runway = compute_runway(df, product, dmax)
-    variance = compute_variance(df, product, targets, cur_s, cur_e)
-    rankings = compute_rankings(targets, variance)
+    targets = compute_targets(df_all, product, base_s, base_e, cur_s, cur_e)
+    variance_rank = compute_variance(df_all, product, targets, cur_s, cur_e)
+    rankings = compute_rankings(targets, variance_rank)
+    runway_all = pd.concat([compute_runway(df, rp, dmax).assign(product=rp)
+                            for rp in real_products], ignore_index=True)
 
     fmt = lambda d: pd.Timestamp(d).strftime("%d %b %Y")
     st.markdown(
@@ -622,7 +677,7 @@ def main():
         f"<div class='meta'>{len(stations)} stations · {fmt(dmin)} → {fmt(dmax)} · "
         f"viewing {PLABEL[product]} · baseline {fmt(base_s)}→{fmt(base_e)} · "
         f"current {fmt(cur_s)}→{fmt(cur_e)}</div></div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='summary'>📋 {analyst_summary(product, targets, runway, rankings)}</div>",
+    st.markdown(f"<div class='summary'>📋 {analyst_summary(PLABEL[product], targets, runway_all)}</div>",
                 unsafe_allow_html=True)
 
     def kpi_row(items):
@@ -633,9 +688,13 @@ def main():
             for l, v, u, s, a in items)
         st.markdown(f"<div class='kpi-row'>{cards}</div>", unsafe_allow_html=True)
 
+    def phead(rp):
+        st.markdown(f"<div class='prodhead' style='--acc2:{PCOL[rp]}'>{PLABEL[rp]}</div>",
+                    unsafe_allow_html=True)
+
     f0 = lambda x: "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:,.0f}"
-    tabs = st.tabs(["Overview", "Targets vs Actual", "Price Sensitivity",
-                    "Days to Run Out", "Variance", "Rankings", "Trends"])
+    tabs = st.tabs(["Overview", "Targets vs Actual", "Price Sensitivity", "Days to Run Out",
+                    "Efficiency", "Variance", "Rankings", "Trends"])
 
     # ============================ OVERVIEW ============================
     with tabs[0]:
@@ -652,7 +711,8 @@ def main():
             ctx = focus
         att = tot_a / tot_t * 100 if tot_t and not np.isnan(tot_t) and tot_t > 0 else np.nan
 
-        st.markdown(f"<div class='eyebrow'>{ctx} · {PLABEL[product]}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='eyebrow'>{ctx} · {PLABEL[product]} · current period</div>",
+                    unsafe_allow_html=True)
         kpi_row([
             ("Actual sold (current)", f0(tot_a), "L", "this period so far", accent),
             ("Monthly target", f0(tot_t), "L", "2× median baseline month", accent),
@@ -661,15 +721,13 @@ def main():
             ("Median month", f0(med), "L", "typical baseline month", accent),
         ])
         st.write("")
-
         g1, g2 = st.columns([1, 1.5], gap="large")
         with g1:
             gv = 0 if np.isnan(att) else att
             gauge = go.Figure(go.Indicator(
                 mode="gauge+number", value=gv,
                 number={"suffix": "%", "font": {"size": 40, "color": accent}},
-                title={"text": "of monthly target obtained",
-                       "font": {"size": 13, "color": INK}},
+                title={"text": "of monthly target obtained", "font": {"size": 13, "color": INK}},
                 gauge={"axis": {"range": [0, max(120, gv + 15)], "tickcolor": INK,
                                 "tickfont": {"color": INK}},
                        "bar": {"color": accent, "thickness": 0.3},
@@ -685,37 +743,33 @@ def main():
             fig = go.Figure()
             fig.add_bar(y=top["station"], x=top["monthly_target"], orientation="h",
                         name="Target", marker_color="rgba(140,140,140,.30)")
-            fig.add_bar(y=top["station"], x=top["actual_total"], orientation="h",
-                        name="Actual", marker_color=accent,
-                        text=labels, textposition="outside",
-                        textfont=dict(color=INK, size=11))
-            fig.update_layout(barmode="group", title="Actual vs target by station "
-                              "(label = % obtained)")
+            fig.add_bar(y=top["station"], x=top["actual_total"], orientation="h", name="Actual",
+                        marker_color=accent, text=labels, textposition="outside",
+                        textfont=dict(color=INK, size=11), cliponaxis=False)
+            fig.update_layout(barmode="group",
+                              title="Actual vs target by station (label = % obtained)")
             st.plotly_chart(style_fig(fig, 330, accent), use_container_width=True)
 
-        # month-to-date pace toward the target
         st.markdown("<div class='eyebrow'>Month-to-date pace toward target</div>",
                     unsafe_allow_html=True)
         if focus == "All stations":
-            cs = (_slice(df, product, cur_s, cur_e).groupby("date", as_index=False)
+            cs = (_slice(df_all, product, cur_s, cur_e).groupby("date", as_index=False)
                   .agg(volume=("volume", "sum")))
-            tgt_val = tot_t
         else:
-            cs = _slice(df, product, cur_s, cur_e)
+            cs = _slice(df_all, product, cur_s, cur_e)
             cs = cs[cs["station"] == focus][["date", "volume"]]
-            tgt_val = tot_t
         cs = cs.sort_values("date")
-        if not cs.empty and not np.isnan(tgt_val):
+        if not cs.empty and not np.isnan(tot_t):
             cs["cum"] = cs["volume"].fillna(0).cumsum()
             m0 = pd.Timestamp(date(cur_s.year, cur_s.month, 1))
             m_end = (m0 + pd.offsets.MonthEnd(1)).normalize()
             fig = go.Figure()
-            fig.add_scatter(x=[m0, m_end], y=[0, tgt_val], name="Ideal pace",
+            fig.add_scatter(x=[m0, m_end], y=[0, tot_t], name="Ideal pace",
                             line=dict(color=INK, width=1.4, dash="dot"))
-            fig.add_scatter(x=cs["date"], y=cs["cum"], name="Cumulative actual",
-                            mode="lines", line=dict(color=accent, width=3),
-                            fill="tozeroy", fillcolor=PSTEP[product])
-            fig.add_hline(y=tgt_val, line_dash="dash", line_color=accent,
+            fig.add_scatter(x=cs["date"], y=cs["cum"], name="Cumulative actual", mode="lines",
+                            line=dict(color=accent, width=3), fill="tozeroy",
+                            fillcolor=PSTEP[product])
+            fig.add_hline(y=tot_t, line_dash="dash", line_color=accent,
                           annotation_text="monthly target", annotation_font_color=INK)
             fig.update_layout(title="Cumulative sales vs target this month")
             fig.update_yaxes(title_text="Cumulative litres")
@@ -737,9 +791,9 @@ def main():
                 "Operating days", "Actual total (L)", "Attainment %", "Gap (L)", "Status"]
         st.dataframe(show[cols].style.format({
             "Median month (L)": "{:,.0f}", "Monthly target (L)": "{:,.0f}",
-            "Actual total (L)": "{:,.0f}", "Attainment %": "{:,.0f}%",
-            "Gap (L)": "{:,.0f}"}, na_rep="—"),
-            use_container_width=True, hide_index=True, height=min(560, 80 + 36 * len(show)))
+            "Actual total (L)": "{:,.0f}", "Attainment %": "{:,.0f}%", "Gap (L)": "{:,.0f}"},
+            na_rep="—"), use_container_width=True, hide_index=True,
+            height=min(560, 80 + 36 * len(show)))
         att = targets.dropna(subset=["attainment_pct"]).sort_values("attainment_pct")
         if not att.empty:
             fig = px.bar(att, x="attainment_pct", y="station", orientation="h",
@@ -748,11 +802,10 @@ def main():
             fig.update_traces(
                 marker_color=[accent if a >= 100 else (PSTEP[product] if a >= 75 else
                               "rgba(140,140,140,.45)") for a in att["attainment_pct"]],
-                text=[f"{a:.0f}%" for a in att["attainment_pct"]],
-                textposition="outside", textfont=dict(color=INK, size=11), cliponaxis=False)
+                text=[f"{a:.0f}%" for a in att["attainment_pct"]], textposition="outside",
+                textfont=dict(color=INK, size=11), cliponaxis=False)
             fig.add_vline(x=100, line_dash="dash", line_color=INK, annotation_text="target")
-            st.plotly_chart(style_fig(fig, max(280, 34 * len(att)), accent),
-                            use_container_width=True)
+            st.plotly_chart(style_fig(fig, max(280, 34 * len(att)), accent), use_container_width=True)
         st.download_button("⬇ Download targets (CSV)", show[cols].to_csv(index=False),
                            f"targets_{product}.csv", "text/csv")
 
@@ -760,140 +813,122 @@ def main():
     with tabs[2]:
         st.markdown("<div class='eyebrow'>Across all available history</div>",
                     unsafe_allow_html=True)
-        if focus == "All stations":
-            st.subheader(f"Price sensitivity by station — {PLABEL[product]}")
-            ae = all_elasticities(df, product)
-            plotable = ae.dropna(subset=["elasticity"])
-            if not plotable.empty:
-                fig = px.bar(plotable.sort_values("elasticity"), x="elasticity", y="station",
-                             orientation="h", title="Price elasticity by station "
-                             "(more negative = more price-sensitive)",
-                             labels={"elasticity": "Elasticity", "station": ""})
-                fig.update_traces(marker_color=accent,
-                                  text=[f"{e:.2f}" for e in plotable.sort_values("elasticity")["elasticity"]],
-                                  textposition="outside", textfont=dict(color=INK, size=11),
-                                  cliponaxis=False)
-                fig.add_vline(x=-1, line_dash="dot", line_color=INK,
-                              annotation_text="unit-elastic")
-                st.plotly_chart(style_fig(fig, max(280, 36 * len(plotable)), accent),
-                                use_container_width=True)
-            tbl = ae.rename(columns={"station": "Station", "elasticity": "Elasticity",
-                                     "r2": "Fit R²", "type": "Type",
-                                     "per_10pesewa": "Litres per +GHS0.10",
-                                     "reaction": "Customer reaction"})
-            st.dataframe(tbl.style.format({
-                "Elasticity": "{:.2f}", "Fit R²": "{:.2f}",
-                "Litres per +GHS0.10": "{:,.0f}"}, na_rep="—"),
-                use_container_width=True, hide_index=True,
-                height=min(520, 80 + 36 * len(tbl)))
-            st.caption("Pick a single station in the sidebar to see its demand curve, "
-                       "price-level breakdown and price-change event study.")
-        else:
-            el = elasticity(df, focus, product, dmin, dmax)
-            st.subheader(f"{focus} · {PLABEL[product]} — price sensitivity")
-            if not np.isnan(el["elasticity"]):
-                kpi_row([
-                    ("Price elasticity", f"{el['elasticity']:.2f}", "",
-                     elast_label(el["elasticity"]), accent),
-                    ("Litres per +GHS0.10",
-                     "—" if np.isnan(el["per_10pesewa"]) else f"{el['per_10pesewa']:,.0f}",
-                     "L", "linear sensitivity", accent),
-                    ("Model fit", "—" if np.isnan(el["r2"]) else f"{el['r2']*100:.0f}", "%",
-                     "log-log R²", accent),
-                    ("Price levels", f"{el['n_prices']}", "", "distinct prices", accent),
-                ])
-            st.info("💡 " + elast_brief(el["elasticity"]))
 
-            st.write("")
-            c1, c2 = st.columns([1.25, 1], gap="large")
-            with c1:
-                s = df[(df["product"] == product) & (df["station"] == focus)].dropna(
-                    subset=["price", "volume"])
-                s = s[(s["price"] > 0) & (s["volume"] > 0)]
-                if not s.empty:
-                    fig = px.scatter(s, x="price", y="volume",
-                                     labels={"price": "Price (GHS/L)", "volume": "Volume (L/day)"},
-                                     title="Daily volume vs price — demand curve")
-                    fig.update_traces(marker=dict(color=accent, size=8, opacity=0.6))
-                    m, b = np.polyfit(s["price"], s["volume"], 1)
-                    xs = np.array([s["price"].min(), s["price"].max()])
-                    fig.add_scatter(x=xs, y=m * xs + b, mode="lines", name="Trend",
-                                    line=dict(color=INK, dash="dash", width=2))
-                    st.plotly_chart(style_fig(fig, 350, accent), use_container_width=True)
-            with c2:
-                pl = price_levels(df, focus, product, dmin, dmax)
-                if not pl.empty:
-                    fig = go.Figure()
-                    for _, r in pl.iterrows():
-                        fig.add_shape(type="line", x0=0, x1=r["avg_daily"],
-                                      y0=str(r["price"]), y1=str(r["price"]),
-                                      line=dict(color="rgba(140,140,140,.4)", width=2))
-                    fig.add_trace(go.Scatter(
-                        x=pl["avg_daily"], y=pl["price"].astype(str), mode="markers",
-                        marker=dict(color=accent, size=13)))
-                    fig.update_layout(title="Avg daily volume by price level",
-                                      xaxis_title="Avg daily (L)", yaxis_title="Price (GHS/L)")
-                    st.plotly_chart(style_fig(fig, 350, accent), use_container_width=True)
-
-            s2 = df[(df["product"] == product) & (df["station"] == focus)].sort_values("date")
-            if not s2.empty and s2["price"].notna().any():
-                st.markdown("<div class='eyebrow'>Price steps vs daily volume</div>",
-                            unsafe_allow_html=True)
-                fig = make_subplots(specs=[[{"secondary_y": True}]])
-                fig.add_bar(x=s2["date"], y=s2["volume"], name="Volume",
-                            marker_color=PSTEP[product], secondary_y=False)
-                fig.add_scatter(x=s2["date"], y=s2["price"], name="Price", mode="lines",
-                                line=dict(color=accent, width=2.5, shape="hv"), secondary_y=True)
-                fig.update_yaxes(title_text="Volume (L/day)", secondary_y=False)
-                fig.update_yaxes(title_text="Price (GHS/L)", secondary_y=True)
-                st.plotly_chart(style_fig(fig, 300, accent), use_container_width=True)
-
-            ev = price_events(df, focus, product, dmin, dmax)
-            st.markdown("<div class='eyebrow'>Price-change event study</div>",
-                        unsafe_allow_html=True)
-            if ev.empty:
-                st.caption("No price changes recorded for this station.")
+        def render_price(rp):
+            acc = PCOL[rp]
+            if focus == "All stations":
+                ae = all_elasticities(df, rp)
+                plotable = ae.dropna(subset=["elasticity"])
+                if not plotable.empty:
+                    pe = plotable.sort_values("elasticity")
+                    fig = px.bar(pe, x="elasticity", y="station", orientation="h",
+                                 title="Price elasticity by station "
+                                 "(more negative = more price-sensitive)",
+                                 labels={"elasticity": "Elasticity", "station": ""})
+                    fig.update_traces(marker_color=acc, text=[f"{e:.2f}" for e in pe["elasticity"]],
+                                      textposition="outside", textfont=dict(color=INK, size=11),
+                                      cliponaxis=False)
+                    fig.add_vline(x=-1, line_dash="dot", line_color=INK, annotation_text="unit-elastic")
+                    st.plotly_chart(style_fig(fig, max(280, 36 * len(pe)), acc),
+                                    use_container_width=True)
+                tbl = ae.rename(columns={"station": "Station", "elasticity": "Elasticity",
+                                         "r2": "Fit R²", "type": "Type",
+                                         "per_10pesewa": "Litres per +GHS0.10",
+                                         "reaction": "Customer reaction"})
+                st.dataframe(tbl.style.format({"Elasticity": "{:.2f}", "Fit R²": "{:.2f}",
+                                               "Litres per +GHS0.10": "{:,.0f}"}, na_rep="—"),
+                             use_container_width=True, hide_index=True,
+                             height=min(480, 80 + 36 * len(tbl)))
+                st.caption("Pick a single station in the sidebar for its demand curve and event study.")
             else:
-                evs = ev.rename(columns={"date": "Date", "old_price": "Old", "new_price": "New",
-                                         "price_chg_pct": "Price Δ%", "avg_before": "Avg before (L)",
-                                         "avg_after": "Avg after (L)", "vol_chg_pct": "Volume Δ%",
-                                         "arc_elasticity": "Arc elasticity"})
-                evs["Date"] = pd.to_datetime(evs["Date"]).dt.strftime("%d %b %Y")
-                st.dataframe(evs.style.format({
-                    "Old": "{:,.2f}", "New": "{:,.2f}", "Price Δ%": "{:+.1f}%",
-                    "Avg before (L)": "{:,.0f}", "Avg after (L)": "{:,.0f}",
-                    "Volume Δ%": "{:+.1f}%", "Arc elasticity": "{:.2f}"}, na_rep="—"),
-                    use_container_width=True, hide_index=True)
+                el = elasticity(df, focus, rp, dmin, dmax)
+                if not np.isnan(el["elasticity"]):
+                    kpi_row([
+                        ("Price elasticity", f"{el['elasticity']:.2f}", "",
+                         elast_label(el["elasticity"]), acc),
+                        ("Litres per +GHS0.10",
+                         "—" if np.isnan(el["per_10pesewa"]) else f"{el['per_10pesewa']:,.0f}",
+                         "L", "linear sensitivity", acc),
+                        ("Model fit", "—" if np.isnan(el["r2"]) else f"{el['r2']*100:.0f}", "%",
+                         "log-log R²", acc),
+                        ("Price levels", f"{el['n_prices']}", "", "distinct prices", acc)])
+                st.info("💡 " + elast_brief(el["elasticity"]))
+                c1, c2 = st.columns([1.25, 1], gap="large")
+                with c1:
+                    s = df[(df["product"] == rp) & (df["station"] == focus)].dropna(
+                        subset=["price", "volume"])
+                    s = s[(s["price"] > 0) & (s["volume"] > 0)]
+                    if not s.empty:
+                        fig = px.scatter(s, x="price", y="volume",
+                                         labels={"price": "Price (GHS/L)", "volume": "Volume (L/day)"},
+                                         title="Daily volume vs price — demand curve")
+                        fig.update_traces(marker=dict(color=acc, size=8, opacity=0.6))
+                        m, b = np.polyfit(s["price"], s["volume"], 1)
+                        xs = np.array([s["price"].min(), s["price"].max()])
+                        fig.add_scatter(x=xs, y=m * xs + b, mode="lines", name="Trend",
+                                        line=dict(color=INK, dash="dash", width=2))
+                        st.plotly_chart(style_fig(fig, 340, acc), use_container_width=True)
+                with c2:
+                    pl = price_levels(df, focus, rp, dmin, dmax)
+                    if not pl.empty:
+                        fig = go.Figure()
+                        for _, r in pl.iterrows():
+                            fig.add_shape(type="line", x0=0, x1=r["avg_daily"],
+                                          y0=str(r["price"]), y1=str(r["price"]),
+                                          line=dict(color="rgba(140,140,140,.4)", width=2))
+                        fig.add_trace(go.Scatter(x=pl["avg_daily"], y=pl["price"].astype(str),
+                                                 mode="markers", marker=dict(color=acc, size=13)))
+                        fig.update_layout(title="Avg daily volume by price level",
+                                          xaxis_title="Avg daily (L)", yaxis_title="Price (GHS/L)")
+                        st.plotly_chart(style_fig(fig, 340, acc), use_container_width=True)
+                ev = price_events(df, focus, rp, dmin, dmax)
+                if not ev.empty:
+                    st.markdown("<div class='note'>Price-change event study</div>",
+                                unsafe_allow_html=True)
+                    evs = ev.rename(columns={"date": "Date", "old_price": "Old", "new_price": "New",
+                                             "price_chg_pct": "Price Δ%", "avg_before": "Avg before (L)",
+                                             "avg_after": "Avg after (L)", "vol_chg_pct": "Volume Δ%",
+                                             "arc_elasticity": "Arc elasticity"})
+                    evs["Date"] = pd.to_datetime(evs["Date"]).dt.strftime("%d %b %Y")
+                    st.dataframe(evs.style.format({
+                        "Old": "{:,.2f}", "New": "{:,.2f}", "Price Δ%": "{:+.1f}%",
+                        "Avg before (L)": "{:,.0f}", "Avg after (L)": "{:,.0f}",
+                        "Volume Δ%": "{:+.1f}%", "Arc elasticity": "{:.2f}"}, na_rep="—"),
+                        use_container_width=True, hide_index=True)
+
+        for rp in real_products:
+            if len(real_products) > 1:
+                phead(rp)
+            render_price(rp)
 
     # ============================ RUNWAY ============================
     with tabs[3]:
         st.markdown("<div class='eyebrow'>Stock cover · rolling-average method</div>",
                     unsafe_allow_html=True)
-        st.subheader(f"Days to run out — {PLABEL[product]}")
         st.caption(f"Latest tank stock ÷ {RUNWAY_WINDOW}-day rolling-average daily sales. "
                    "Physical dip used where available, else book closing stock.")
-        if runway.empty:
-            st.info("No stock readings detected for this product.")
-        else:
-            colormap = {"critical": "#7A0010", "low": "#E23744", "watch": "#C5821C",
-                        "healthy": "#1F9D57", "no estimate": "rgba(140,140,140,.55)"}
-            plotr = runway.dropna(subset=["days_to_run_out"])
+        colormap = {"critical": "#7A0010", "low": "#E23744", "watch": "#C5821C",
+                    "healthy": "#1F9D57", "no estimate": "rgba(140,140,140,.55)"}
+
+        def render_runway(rp):
+            rw = runway_all[runway_all["product"] == rp].drop(columns=["product"])
+            if rw.empty:
+                st.info("No stock readings for this product.")
+                return
+            plotr = rw.dropna(subset=["days_to_run_out"])
             if not plotr.empty:
-                # most-urgent (shortest cover) on top
                 order = list(plotr.sort_values("days_to_run_out", ascending=False)["station"])
                 fig = px.bar(plotr, x="days_to_run_out", y="station", orientation="h",
                              color="risk", color_discrete_map=colormap,
                              category_orders={"station": order},
                              labels={"days_to_run_out": "Days of cover", "station": "", "risk": ""},
                              title="Stock cover by station (label = days)")
-                # colouring by risk splits the data into one series per risk, so a single
-                # broadcast text list would mis-map. texttemplate reads each bar's own x value.
                 fig.update_traces(texttemplate="%{x:.1f}", textposition="outside",
                                   textfont=dict(color=INK, size=11), cliponaxis=False)
                 fig.add_vline(x=3, line_dash="dot", line_color=INK, annotation_text="3-day floor")
-                st.plotly_chart(style_fig(fig, max(280, 36 * len(plotr)), accent),
+                st.plotly_chart(style_fig(fig, max(280, 36 * len(plotr)), PCOL[rp]),
                                 use_container_width=True)
-            rv = runway.copy()
+            rv = rw.copy()
             rv["as_of"] = pd.to_datetime(rv["as_of"]).dt.strftime("%d %b %Y")
             show = rv.rename(columns={"station": "Station", "as_of": "As of",
                                       "stock_litres": "Stock (L)", "stock_source": "Stock source",
@@ -904,57 +939,132 @@ def main():
                 "Days to run out": "{:,.1f}"}, na_rep="—"),
                 use_container_width=True, hide_index=True)
 
-    # ============================ VARIANCE ============================
+        for rp in real_products:
+            st.subheader(f"Days to run out — {PLABEL[rp]}")
+            render_runway(rp)
+
+    # ============================ EFFICIENCY ============================
     with tabs[4]:
+        st.markdown("<div class='eyebrow'>Sell-through speed</div>", unsafe_allow_html=True)
+        st.caption("Average days to stock out = typical tank stock ÷ average daily sales. "
+                   "Refill cycle = average days between deliveries. Shorter = faster turnover.")
+
+        def render_eff(rp):
+            eff = compute_efficiency(df, rp)
+            if eff.empty:
+                st.info("No data for this product.")
+                return
+            valid = eff.dropna(subset=["days_to_stockout"])
+            if not valid.empty:
+                fast = valid.iloc[0]
+                slow = valid.iloc[-1]
+                st.markdown(f"<div class='note'>Fastest mover: <b>{fast['station']}</b> "
+                            f"(~{fast['days_to_stockout']:.1f} days to stock out) · slowest: "
+                            f"<b>{slow['station']}</b> (~{slow['days_to_stockout']:.1f} days).</div>",
+                            unsafe_allow_html=True)
+                order = list(valid.sort_values("days_to_stockout", ascending=False)["station"])
+                fig = px.bar(valid, x="days_to_stockout", y="station", orientation="h",
+                             category_orders={"station": order},
+                             labels={"days_to_stockout": "Avg days to stock out", "station": ""},
+                             title="Average days to stock out (shorter = sells through faster)")
+                fig.update_traces(marker_color=PCOL[rp],
+                                  text=[f"{d:.1f}" for d in valid["days_to_stockout"]],
+                                  textposition="outside", textfont=dict(color=INK, size=11),
+                                  cliponaxis=False)
+                st.plotly_chart(style_fig(fig, max(280, 36 * len(valid)), PCOL[rp]),
+                                use_container_width=True)
+            show = eff.rename(columns={
+                "station": "Station", "avg_daily_sales": "Avg daily sales (L)",
+                "avg_stock": "Avg stock (L)", "days_to_stockout": "Avg days to stock out",
+                "refill_cycle_days": "Refill cycle (days)", "turnover_per_day": "Turnover/day",
+                "deliveries": "Deliveries", "refills_per_month": "Refills / month",
+                "stockout_days": "Stock-out days"})
+            st.dataframe(show.style.format({
+                "Avg daily sales (L)": "{:,.0f}", "Avg stock (L)": "{:,.0f}",
+                "Avg days to stock out": "{:,.1f}", "Refill cycle (days)": "{:,.1f}",
+                "Turnover/day": "{:.2%}", "Refills / month": "{:,.1f}"}, na_rep="—"),
+                use_container_width=True, hide_index=True)
+
+        for rp in real_products:
+            st.subheader(f"Efficiency — {PLABEL[rp]}")
+            render_eff(rp)
+
+    # ============================ VARIANCE ============================
+    with tabs[5]:
         st.markdown("<div class='eyebrow'>Plan, stock & delivery control</div>",
                     unsafe_allow_html=True)
-        st.subheader(f"Variance analysis — {PLABEL[product]}")
-        st.caption("Target variance (actual − target), dip variance (physical vs book stock), "
-                   "and tanker delivery shortage / overage — over the current period.")
-        if variance.empty:
-            st.info("No variance data in this window.")
-        else:
-            vv = variance.copy()
+        st.caption("Target variance (actual − target), dip variance vs the allowable stock-loss "
+                   "standard, and tanker delivery shortage / overage — over the current period.")
+
+        def render_var(rp):
+            tg = compute_targets(df, rp, base_s, base_e, cur_s, cur_e)
+            vv = compute_variance(df, rp, tg, cur_s, cur_e, STANDARD[rp])
+            if vv.empty:
+                st.info("No variance data.")
+                return
+            std = STANDARD[rp]
+            within = vv["within_standard"]
+            n_ok = int((within == True).sum())
+            n_bad = int((within == False).sum())
+            st.markdown(f"<div class='note'>Allowable stock loss for {rp}: "
+                        f"<b>{std:.2f}%</b> of throughput · within standard: <b>{n_ok}</b> · "
+                        f"exceeding: <b>{n_bad}</b>.</div>", unsafe_allow_html=True)
             c1, c2 = st.columns(2, gap="large")
             with c1:
                 fig = px.bar(vv, x="target_variance", y="station", orientation="h",
                              title="Target variance (L)",
                              labels={"target_variance": "Litres vs target", "station": ""})
-                fig.update_traces(marker_color=[accent if x >= 0 else "rgba(140,140,140,.5)"
+                fig.update_traces(marker_color=[PCOL[rp] if x >= 0 else "rgba(140,140,140,.5)"
                                                 for x in vv["target_variance"].fillna(0)])
                 fig.add_vline(x=0, line_color=INK)
-                st.plotly_chart(style_fig(fig, max(280, 32 * len(vv)), accent),
+                st.plotly_chart(style_fig(fig, max(280, 32 * len(vv)), PCOL[rp]),
                                 use_container_width=True)
             with c2:
-                fig = px.bar(vv, x="dip_variance", y="station", orientation="h",
-                             title="Dip variance (L) — stock control",
-                             labels={"dip_variance": "Physical − book (L)", "station": ""})
-                fig.update_traces(marker_color=["#7A0010" if abs(x) > 0 else accent
-                                                for x in vv["dip_variance"].fillna(0)])
-                fig.add_vline(x=0, line_color=INK)
-                st.plotly_chart(style_fig(fig, max(280, 32 * len(vv)), accent),
-                                use_container_width=True)
-            show = vv.rename(columns={"station": "Station", "throughput": "Throughput (L)",
-                                      "target_variance": "Target variance (L)",
-                                      "target_var_pct": "Target var %",
-                                      "dip_variance": "Dip variance (L)",
-                                      "stock_loss_pct": "Stock loss %",
-                                      "delivery_shortage": "Delivery shortage (L)"})
-            st.dataframe(show.style.format({
+                vp = vv.dropna(subset=["abs_loss_pct"])
+                if not vp.empty:
+                    fig = px.bar(vp, x="abs_loss_pct", y="station", orientation="h",
+                                 title=f"Stock loss % vs {std:.2f}% standard",
+                                 labels={"abs_loss_pct": "Stock loss % of throughput", "station": ""})
+                    fig.update_traces(
+                        marker_color=["#7A0010" if a > std else "#1F9D57" for a in vp["abs_loss_pct"]],
+                        text=[f"{a:.2f}%" for a in vp["abs_loss_pct"]], textposition="outside",
+                        textfont=dict(color=INK, size=11), cliponaxis=False)
+                    fig.add_vline(x=std, line_dash="dash", line_color=INK,
+                                  annotation_text=f"{std:.2f}% standard")
+                    st.plotly_chart(style_fig(fig, max(280, 32 * len(vp)), PCOL[rp]),
+                                    use_container_width=True)
+            show = vv.copy()
+            show["within_standard"] = show["within_standard"].map(
+                {True: "✓ within", False: "✗ exceeds"}).fillna("—")
+            show = show.rename(columns={
+                "station": "Station", "throughput": "Throughput (L)",
+                "target_variance": "Target variance (L)", "target_var_pct": "Target var %",
+                "dip_variance": "Dip variance (L)", "stock_loss_pct": "Stock loss %",
+                "standard_pct": "Standard %", "loss_vs_standard": "Over by (pp)",
+                "within_standard": "Status", "delivery_shortage": "Delivery shortage (L)"})
+            cols = ["Station", "Throughput (L)", "Target variance (L)", "Target var %",
+                    "Dip variance (L)", "Stock loss %", "Standard %", "Over by (pp)",
+                    "Status", "Delivery shortage (L)"]
+            st.dataframe(show[cols].style.format({
                 "Throughput (L)": "{:,.0f}", "Target variance (L)": "{:,.0f}",
                 "Target var %": "{:+.1f}%", "Dip variance (L)": "{:,.1f}",
-                "Stock loss %": "{:+.2f}%", "Delivery shortage (L)": "{:,.0f}"}, na_rep="—"),
+                "Stock loss %": "{:+.2f}%", "Standard %": "{:.2f}%",
+                "Over by (pp)": "{:+.2f}", "Delivery shortage (L)": "{:,.0f}"}, na_rep="—"),
                 use_container_width=True, hide_index=True)
 
+        for rp in real_products:
+            st.subheader(f"Variance — {PLABEL[rp]}")
+            render_var(rp)
+
     # ============================ RANKINGS ============================
-    with tabs[5]:
-        st.markdown("<div class='eyebrow'>Composite performance index</div>",
+    with tabs[6]:
+        st.markdown("<div class='eyebrow'>Composite performance index · current period</div>",
                     unsafe_allow_html=True)
         st.subheader(f"Station rankings — {PLABEL[product]}")
         st.caption(f"Blends attainment {RANK_W_ATTAIN:.0%}, throughput {RANK_W_VOLUME:.0%}, "
                    f"stock discipline {RANK_W_DISCIPLINE:.0%}.")
         if rankings.empty:
-            st.info("No data to rank in this window.")
+            st.info("No data to rank.")
         else:
             medals = {1: "🥇", 2: "🥈", 3: "🥉"}
             rk = rankings.copy()
@@ -962,9 +1072,9 @@ def main():
             plo = rankings.head(15).iloc[::-1]
             fig = px.bar(plo, x="score", y="station", orientation="h", title="Performance index",
                          labels={"score": "Index (0–100)", "station": ""})
-            fig.update_traces(marker_color=accent,
-                              text=[f"{s:.0f}" for s in plo["score"]], textposition="outside",
-                              textfont=dict(color=INK, size=11), cliponaxis=False)
+            fig.update_traces(marker_color=accent, text=[f"{s:.0f}" for s in plo["score"]],
+                              textposition="outside", textfont=dict(color=INK, size=11),
+                              cliponaxis=False)
             st.plotly_chart(style_fig(fig, max(280, 36 * min(15, len(rankings))), accent),
                             use_container_width=True)
             show = rk.rename(columns={"rank": "Rank", "station": "Station", "score": "Index",
@@ -979,37 +1089,52 @@ def main():
                 na_rep="—"), use_container_width=True, hide_index=True)
 
     # ============================ TRENDS ============================
-    with tabs[6]:
+    with tabs[7]:
         st.markdown("<div class='eyebrow'>Full history</div>", unsafe_allow_html=True)
         st.subheader(f"Trends — {PLABEL[product]} · {focus}")
-        if focus == "All stations":
-            s = (df[df["product"] == product].groupby("date", as_index=False)
-                 .agg(volume=("volume", "sum")))
-            s["price"] = np.nan
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        any_data = False
+        if product == "BOTH":
+            for rp in ["PMS", "AGO"]:
+                if focus == "All stations":
+                    s = (df[df["product"] == rp].groupby("date", as_index=False)
+                         .agg(volume=("volume", "sum")))
+                else:
+                    s = df[(df["product"] == rp) & (df["station"] == focus)][["date", "volume"]]
+                s = s.sort_values("date")
+                if not s.empty:
+                    any_data = True
+                    fig.add_scatter(x=s["date"], y=s["volume"], name=rp,
+                                    line=dict(color=PCOL[rp], width=2), secondary_y=False)
+            fig.update_layout(title="Daily volume by product")
         else:
-            s = df[(df["product"] == product) & (df["station"] == focus)][["date", "volume", "price"]]
-        s = s.sort_values("date")
-        if s.empty:
-            st.info("No data for this selection.")
-        else:
-            s["ma"] = s["volume"].rolling(7, min_periods=1).mean()
-            fig = make_subplots(specs=[[{"secondary_y": True}]])
-            fig.add_bar(x=s["date"], y=s["volume"], name="Daily volume",
-                        marker_color=PSTEP[product], secondary_y=False)
-            fig.add_scatter(x=s["date"], y=s["ma"], name="7-day average",
-                            line=dict(color=accent, width=2.5), secondary_y=False)
-            if focus != "All stations" and s["price"].notna().any():
-                fig.add_scatter(x=s["date"], y=s["price"], name="Price",
-                                line=dict(color=INK, width=1.5, shape="hv"), secondary_y=True)
-                fig.update_yaxes(title_text="Price (GHS/L)", secondary_y=True)
-            fig.add_vrect(x0=cur_s, x1=cur_e, fillcolor="rgba(140,140,140,.10)",
-                          line_width=0, annotation_text="current", annotation_position="top left")
+            if focus == "All stations":
+                s = (df[df["product"] == product].groupby("date", as_index=False)
+                     .agg(volume=("volume", "sum")))
+                s["price"] = np.nan
+            else:
+                s = df[(df["product"] == product) & (df["station"] == focus)][
+                    ["date", "volume", "price"]]
+            s = s.sort_values("date")
+            if not s.empty:
+                any_data = True
+                s["ma"] = s["volume"].rolling(7, min_periods=1).mean()
+                fig.add_bar(x=s["date"], y=s["volume"], name="Daily volume",
+                            marker_color=PSTEP[product], secondary_y=False)
+                fig.add_scatter(x=s["date"], y=s["ma"], name="7-day average",
+                                line=dict(color=accent, width=2.5), secondary_y=False)
+                if focus != "All stations" and s["price"].notna().any():
+                    fig.add_scatter(x=s["date"], y=s["price"], name="Price",
+                                    line=dict(color=INK, width=1.5, shape="hv"), secondary_y=True)
+                    fig.update_yaxes(title_text="Price (GHS/L)", secondary_y=True)
+                fig.update_layout(title="Daily volume & price")
+        if any_data:
+            fig.add_vrect(x0=cur_s, x1=cur_e, fillcolor="rgba(140,140,140,.10)", line_width=0,
+                          annotation_text="current", annotation_position="top left")
             fig.update_yaxes(title_text="Volume (L/day)", secondary_y=False)
-            fig.update_layout(title="Daily volume & price")
             st.plotly_chart(style_fig(fig, 360, accent), use_container_width=True)
-
             st.markdown("<div class='eyebrow'>Weekly volume heatmap</div>", unsafe_allow_html=True)
-            hm = df[df["product"] == product].copy()
+            hm = df_all[df_all["product"] == product].copy()
             hm["week"] = hm["date"].dt.to_period("W").dt.start_time
             piv = hm.pivot_table(index="station", columns="week", values="volume", aggfunc="sum")
             if not piv.empty:
@@ -1018,6 +1143,8 @@ def main():
                     y=list(piv.index), colorscale=SCALE[product], colorbar=dict(title="L/wk")))
                 st.plotly_chart(style_fig(fig, max(260, 30 * len(piv)), accent),
                                 use_container_width=True)
+        else:
+            st.info("No data for this selection.")
 
     st.caption("All figures from the MASTER sheet · prices in GHS · target = 2× median "
                "baseline month, measured against the current period.")
