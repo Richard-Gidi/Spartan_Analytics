@@ -128,6 +128,12 @@ def build_records(rows):
         "AGO_dip": _find(header, "AGO DIP", fallback=16),
         "PMS_dvar": _find(header, "PMS DV", fallback=17),
         "AGO_dvar": _find(header, "AGO DV", fallback=18),
+        # ---- BANKING (station-level; new columns, located by header name only) ----
+        "value": _find(header, "VALUE", fallback=10),
+        "banked": _find(header, "BANKED", fallback=-1),
+        "bankname": _find(header, "BANK", fallback=-1),
+        "deposited": _find(header, "AMOUNT DEPOSITED", "DEPOSITED", "DEPOSIT", fallback=-1),
+        "balance": _find(header, "BALANCE LEFT", "BALANCE", fallback=-1),
     }
 
     def g(r, key):
@@ -143,6 +149,18 @@ def build_records(rows):
         st = "" if st is None else str(st).strip()
         if pd.isna(d) or not st or st.upper() in {"DATE", "STATION"}:
             continue
+        def _clean(x):
+            if x is None or (isinstance(x, float) and math.isnan(x)):
+                return None
+            s = str(x).strip()
+            return None if s == "" or s.lower() == "nan" else s
+        banking = {
+            "sales_value": parse_num(g(r, "value")),
+            "deposited": parse_num(g(r, "deposited")),
+            "balance_left": parse_num(g(r, "balance")),
+            "bank": _clean(g(r, "bankname")),
+            "banked_flag": _clean(g(r, "banked")),
+        }
         for p in ("PMS", "AGO"):
             recs.append({
                 "date": d, "station": st, "product": p,
@@ -153,6 +171,7 @@ def build_records(rows):
                 "dip_var": parse_num(g(r, f"{p}_dvar")),
                 "shortage": parse_num(g(r, f"{p}_short")),
                 "discharge": parse_num(g(r, f"{p}_disch")),
+                **banking,
             })
     df = pd.DataFrame(recs)
     if not df.empty:
@@ -171,6 +190,9 @@ def with_combined(df):
                 discharge=("discharge", sm)))
     g["product"] = "BOTH"
     g["price"] = np.nan
+    for col in ("sales_value", "deposited", "balance_left", "bank", "banked_flag"):
+        if col in df.columns:
+            g[col] = None if col in ("bank", "banked_flag") else np.nan
     g = g[df.columns]
     out = pd.concat([df, g], ignore_index=True)
     return out.sort_values(["station", "product", "date"]).reset_index(drop=True)
@@ -487,6 +509,86 @@ def compute_rankings(targets_df, variance_df,
     return df.reset_index()
 
 
+# ───────────────────────────── banking analytics ───────────────────────────
+def banking_frame(df, start=None, end=None):
+    """Station-level banking rows (read from PMS rows where banking fields are
+    attached). Value = daily cash to bank; deposited = cash deposited; balance_left
+    = running unbanked balance; bank = bank name; banked_flag = Yes/No."""
+    cols = ["date", "station", "sales_value", "deposited", "balance_left", "bank", "banked_flag"]
+    if df.empty or "sales_value" not in df.columns:
+        return pd.DataFrame(columns=cols)
+    b = df[df["product"] == "PMS"][cols].copy()
+    if start is not None and end is not None:
+        b = b[(b["date"] >= start) & (b["date"] <= end)]
+    return b.sort_values(["station", "date"]).reset_index(drop=True)
+
+
+def has_value(bk):
+    return (not bk.empty) and bool(bk["sales_value"].notna().any())
+
+
+def has_deposits(bk):
+    if bk.empty:
+        return False
+    return bool(bk[["deposited", "balance_left"]].notna().any().any())
+
+
+def compute_banking(bk):
+    """Per station: cash generated (Value), deposited, banking rate, net unbanked,
+    current outstanding (latest running balance), deposit count, last deposit."""
+    out = []
+    for st in sorted(bk["station"].unique()):
+        ss = bk[bk["station"] == st].sort_values("date")
+        cash = float(ss["sales_value"].dropna().sum())
+        dep = float(ss["deposited"].dropna().sum())
+        rate = (dep / cash * 100) if cash > 0 else np.nan
+        net = cash - dep
+        bl = ss["balance_left"].dropna()
+        outstanding = float(bl.iloc[-1]) if len(bl) else (net if cash > 0 else np.nan)
+        deposits = int((ss["deposited"].fillna(0) > 0).sum())
+        ld = ss[ss["deposited"].fillna(0) > 0]["date"]
+        last_deposit = ld.max() if len(ld) else pd.NaT
+        out.append({"station": st, "cash_generated": cash, "deposited": dep,
+                    "banking_rate": rate, "net_unbanked": net, "outstanding": outstanding,
+                    "deposits": deposits, "last_deposit": last_deposit})
+    res = pd.DataFrame(out)
+    if not res.empty:
+        res = res.sort_values("outstanding", ascending=False,
+                              na_position="last").reset_index(drop=True)
+    return res
+
+
+def banking_by_bank(bk):
+    b = bk.dropna(subset=["deposited"]).copy()
+    b = b[b["bank"].notna() & (b["bank"].astype(str).str.strip() != "")]
+    if b.empty:
+        return pd.DataFrame(columns=["bank", "deposited", "deposits"])
+    b["bank"] = b["bank"].astype(str).str.strip()
+    return (b.groupby("bank")["deposited"].agg(deposited="sum", deposits="count")
+              .reset_index().sort_values("deposited", ascending=False))
+
+
+def banking_summary(bk):
+    if not has_value(bk):
+        return "No banking/Value figures found in this period yet."
+    cb = compute_banking(bk)
+    cash = cb["cash_generated"].sum()
+    dep = cb["deposited"].sum()
+    rate = dep / cash * 100 if cash else np.nan
+    bits = [f"Network generated <b>GHS {cash:,.0f}</b> of bankable cash; "
+            f"<b>GHS {dep:,.0f}</b> deposited"
+            + (f" (<b>{rate:.0f}%</b> banked)." if not np.isnan(rate) else ".")]
+    risk = cb.dropna(subset=["outstanding"])
+    risk = risk[risk["outstanding"] > 0]
+    if len(risk):
+        top = risk.iloc[0]
+        bits.append(f"⚠ Largest unbanked balance: <b>{top['station']}</b> "
+                    f"(GHS {top['outstanding']:,.0f}).")
+    if not has_deposits(bk):
+        bits.append("Deposit columns aren't populated yet, so figures reflect cash generated only.")
+    return " ".join(bits)
+
+
 def analyst_summary(plabel, targets_df, runway_df):
     """Network read for the CURRENT period (target attainment basis)."""
     if targets_df.empty:
@@ -633,6 +735,218 @@ def main():
     stations = sorted(df["station"].unique())
     dmin, dmax = df["date"].min(), df["date"].max()
     (bs_def, be_def), (cs_def, ce_def) = default_windows(dmin, dmax)
+
+    fmt = lambda d: pd.Timestamp(d).strftime("%d %b %Y")
+
+    # ============================ BANKING MODULE ============================
+    def render_banking():
+        acc, step = "#2563EB", "rgba(37,99,235,.22)"
+        bscale = [[0, "rgba(37,99,235,.06)"], [1, "#2563EB"]]
+        st.markdown(f"<style>:root{{--acc:{acc};}}</style>", unsafe_allow_html=True)
+        with st.sidebar:
+            st.markdown("#### Banking period")
+            st.markdown("<span class='note'>cash generated (Value) vs amount deposited; "
+                        "outstanding = unbanked cash still held.</span>", unsafe_allow_html=True)
+            bperiod = st.date_input("Period", (dmin.date(), dmax.date()),
+                                    min_value=dmin.date(), max_value=dmax.date(), key="bperiod")
+            bfocus = st.selectbox("Station focus", ["All stations"] + stations, key="bfocus")
+            st.divider()
+            if st.button("↻ Refresh data", use_container_width=True, key="brefresh"):
+                st.cache_data.clear()
+                st.rerun()
+            st.caption(f"Source: Google · sheet **{used_sheet}**")
+        if isinstance(bperiod, (tuple, list)) and len(bperiod) == 2:
+            bs, be = pd.Timestamp(bperiod[0]), pd.Timestamp(bperiod[1])
+        else:
+            bs, be = dmin, dmax
+        bk = banking_frame(df, bs, be)
+
+        st.markdown(
+            f"<div class='hero'><h1>🏦 Spartan Fuel — Banking"
+            f"<span class='badge'>{used_sheet}</span></h1>"
+            f"<div class='meta'>{len(stations)} stations · cash reconciliation · "
+            f"period {fmt(bs)} → {fmt(be)}</div></div>", unsafe_allow_html=True)
+
+        if not has_value(bk):
+            st.info("No banking/Value figures in this range yet. The **Value** column feeds "
+                    "cash generated, and **Amount Deposited / Balance Left / Bank** feed the "
+                    "rest — populate them in the sheet and this section fills in automatically.")
+            return
+
+        st.markdown(f"<div class='summary'>🏦 {banking_summary(bk)}</div>", unsafe_allow_html=True)
+        cb = compute_banking(bk)
+
+        if bfocus == "All stations":
+            cash = cb["cash_generated"].sum()
+            dep = cb["deposited"].sum()
+            outst = cb["outstanding"].sum(skipna=True)
+            ctx = "All stations"
+        else:
+            row = cb[cb["station"] == bfocus]
+            cash = float(row["cash_generated"].iloc[0]) if len(row) else 0.0
+            dep = float(row["deposited"].iloc[0]) if len(row) else 0.0
+            outst = float(row["outstanding"].iloc[0]) if len(row) else np.nan
+            ctx = bfocus
+        rate = dep / cash * 100 if cash else np.nan
+
+        g0 = lambda x: "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:,.0f}"
+
+        def kcards(items):
+            cards = "".join(
+                f"<div class='kpi'><div class='l'>{l}</div>"
+                f"<div class='v'>{v}<span class='u'>{u}</span></div>"
+                f"<div class='s'>{s}</div><div class='tick' style='background:{acc}'></div></div>"
+                for l, v, u, s in items)
+            st.markdown(f"<div class='kpi-row'>{cards}</div>", unsafe_allow_html=True)
+
+        deposits_seen = has_deposits(bk)
+        btabs = st.tabs(["Overview", "Reconciliation", "By bank", "Trend"])
+
+        # -------- Overview --------
+        with btabs[0]:
+            st.markdown(f"<div class='eyebrow'>{ctx} · cash banking</div>", unsafe_allow_html=True)
+            kcards([
+                ("Cash generated (Value)", g0(cash), "GHS", "to be banked this period"),
+                ("Amount deposited", g0(dep), "GHS", "actually banked"),
+                ("Banked", "—" if np.isnan(rate) else f"{rate:,.0f}", "%",
+                 "of cash deposited"),
+                ("Outstanding (unbanked)", g0(outst), "GHS", "cash still held / at risk"),
+            ])
+            if not deposits_seen:
+                st.caption("Deposit columns aren't populated yet — banked % and deposits show 0 "
+                           "until you fill Amount Deposited.")
+            st.write("")
+            c1, c2 = st.columns([1, 1.5], gap="large")
+            with c1:
+                gv = 0 if np.isnan(rate) else rate
+                gauge = go.Figure(go.Indicator(
+                    mode="gauge+number", value=gv,
+                    number={"suffix": "%", "font": {"size": 40, "color": acc}},
+                    title={"text": "of cash banked", "font": {"size": 13, "color": INK}},
+                    gauge={"axis": {"range": [0, max(110, gv + 10)], "tickcolor": INK,
+                                    "tickfont": {"color": INK}},
+                           "bar": {"color": acc, "thickness": 0.3},
+                           "bgcolor": "rgba(140,140,140,.10)", "borderwidth": 0,
+                           "steps": [{"range": [0, 90], "color": "rgba(140,140,140,.10)"},
+                                     {"range": [90, 100], "color": step}],
+                           "threshold": {"line": {"color": INK, "width": 3},
+                                         "thickness": 0.9, "value": 100}}))
+                st.plotly_chart(style_fig(gauge, 290, acc), use_container_width=True)
+            with c2:
+                top = cb.sort_values("cash_generated", ascending=False).head(12).iloc[::-1]
+                labels = ["—" if np.isnan(r) else f"{r:.0f}%" for r in top["banking_rate"]]
+                fig = go.Figure()
+                fig.add_bar(y=top["station"], x=top["cash_generated"], orientation="h",
+                            name="Cash generated", marker_color="rgba(140,140,140,.30)")
+                fig.add_bar(y=top["station"], x=top["deposited"], orientation="h", name="Deposited",
+                            marker_color=acc, text=labels, textposition="outside",
+                            textfont=dict(color=INK, size=11), cliponaxis=False)
+                fig.update_layout(barmode="group",
+                                  title="Cash generated vs deposited (label = % banked)")
+                st.plotly_chart(style_fig(fig, 330, acc), use_container_width=True)
+
+        # -------- Reconciliation --------
+        with btabs[1]:
+            st.markdown("<div class='eyebrow'>Per-station reconciliation</div>",
+                        unsafe_allow_html=True)
+            outdf = cb.dropna(subset=["outstanding"])
+            outdf = outdf[outdf["outstanding"].abs() > 0].sort_values("outstanding")
+            if not outdf.empty:
+                fig = px.bar(outdf, x="outstanding", y="station", orientation="h",
+                             title="Outstanding (unbanked) cash by station",
+                             labels={"outstanding": "GHS unbanked", "station": ""})
+                fig.update_traces(marker_color=["#B00020" if v > 0 else "#1F9D57"
+                                                for v in outdf["outstanding"]],
+                                  text=[f"{v:,.0f}" for v in outdf["outstanding"]],
+                                  textposition="outside", textfont=dict(color=INK, size=11),
+                                  cliponaxis=False)
+                st.plotly_chart(style_fig(fig, max(280, 34 * len(outdf)), acc),
+                                use_container_width=True)
+            show = cb.copy()
+            show["last_deposit"] = show["last_deposit"].apply(
+                lambda d: "—" if pd.isna(d) else pd.Timestamp(d).strftime("%d %b %Y"))
+            show = show.rename(columns={
+                "station": "Station", "cash_generated": "Cash generated (GHS)",
+                "deposited": "Deposited (GHS)", "banking_rate": "Banked %",
+                "net_unbanked": "Net unbanked (GHS)", "outstanding": "Outstanding (GHS)",
+                "deposits": "Deposits", "last_deposit": "Last deposit"})
+            cols = ["Station", "Cash generated (GHS)", "Deposited (GHS)", "Banked %",
+                    "Net unbanked (GHS)", "Outstanding (GHS)", "Deposits", "Last deposit"]
+            st.dataframe(show[cols].style.format({
+                "Cash generated (GHS)": "{:,.0f}", "Deposited (GHS)": "{:,.0f}",
+                "Banked %": "{:,.0f}%", "Net unbanked (GHS)": "{:,.0f}",
+                "Outstanding (GHS)": "{:,.0f}"}, na_rep="—"),
+                use_container_width=True, hide_index=True,
+                height=min(520, 80 + 36 * len(show)))
+            st.download_button("⬇ Download banking (CSV)", show[cols].to_csv(index=False),
+                               "banking.csv", "text/csv")
+
+        # -------- By bank --------
+        with btabs[2]:
+            st.markdown("<div class='eyebrow'>Deposits by bank</div>", unsafe_allow_html=True)
+            bb = banking_by_bank(bk)
+            if bb.empty:
+                st.info("No bank-tagged deposits in this period yet (the Bank and Amount "
+                        "Deposited columns are still being filled in).")
+            else:
+                c1, c2 = st.columns([1, 1], gap="large")
+                with c1:
+                    donut = px.pie(bb, names="bank", values="deposited", hole=0.58)
+                    donut.update_traces(textposition="outside", textinfo="label+percent",
+                                        textfont=dict(color=INK),
+                                        marker=dict(line=dict(color="rgba(0,0,0,0)", width=2)))
+                    donut.update_layout(showlegend=False,
+                                        colorway=["#2563EB", "#1F9D57", "#C5821C", "#E23744",
+                                                  "#7A0010", "#3A6EA5"])
+                    st.plotly_chart(style_fig(donut, 340, acc), use_container_width=True)
+                with c2:
+                    show = bb.rename(columns={"bank": "Bank", "deposited": "Deposited (GHS)",
+                                              "deposits": "Deposits"})
+                    st.dataframe(show.style.format({"Deposited (GHS)": "{:,.0f}"}),
+                                 use_container_width=True, hide_index=True)
+
+        # -------- Trend --------
+        with btabs[3]:
+            st.markdown("<div class='eyebrow'>Cash vs deposits over time</div>",
+                        unsafe_allow_html=True)
+            if bfocus == "All stations":
+                s = (bk.groupby("date", as_index=False)
+                     .agg(value=("sales_value", "sum"), dep=("deposited", "sum")))
+                s["balance_left"] = np.nan
+            else:
+                s = bk[bk["station"] == bfocus][["date", "sales_value", "deposited",
+                                                 "balance_left"]].rename(
+                    columns={"sales_value": "value", "deposited": "dep"})
+            s = s.sort_values("date")
+            if s.empty:
+                st.info("No data in this range.")
+            else:
+                s["cum_cash"] = s["value"].fillna(0).cumsum()
+                s["cum_dep"] = s["dep"].fillna(0).cumsum()
+                fig = go.Figure()
+                fig.add_scatter(x=s["date"], y=s["cum_cash"], name="Cumulative cash generated",
+                                mode="lines", line=dict(color=INK, width=1.6, dash="dot"))
+                fig.add_scatter(x=s["date"], y=s["cum_dep"], name="Cumulative deposited",
+                                mode="lines", line=dict(color=acc, width=3), fill="tozeroy",
+                                fillcolor=step)
+                fig.update_layout(title="Cumulative cash vs deposits (gap = unbanked)")
+                fig.update_yaxes(title_text="GHS")
+                st.plotly_chart(style_fig(fig, 340, acc), use_container_width=True)
+                if bfocus != "All stations" and s["balance_left"].notna().any():
+                    fig = go.Figure()
+                    fig.add_scatter(x=s["date"], y=s["balance_left"], name="Balance left",
+                                    mode="lines", line=dict(color="#B00020", width=2.5))
+                    fig.update_layout(title="Running unbanked balance (Balance Left)")
+                    fig.update_yaxes(title_text="GHS outstanding")
+                    st.plotly_chart(style_fig(fig, 300, acc), use_container_width=True)
+        st.caption("Banking figures in GHS · Value = daily cash to bank · Balance Left is the "
+                   "running unbanked balance carried forward.")
+
+    module = st.sidebar.radio("Module", ["STOCKS", "BANKING"], horizontal=True, key="module")
+    st.sidebar.divider()
+    if module == "BANKING":
+        render_banking()
+        return
 
     with st.sidebar:
         st.markdown("#### View")
