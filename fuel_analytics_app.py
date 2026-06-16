@@ -991,14 +991,13 @@ def main():
 
     # ============================ VARIANCE ============================
     with tabs[5]:
-        st.markdown("<div class='eyebrow'>Plan, stock & delivery control</div>",
+        st.markdown("<div class='eyebrow'>Stock & delivery control · vs standard</div>",
                     unsafe_allow_html=True)
-        st.caption("Target variance (actual − target), dip variance vs the allowable stock-loss "
-                   "standard, and tanker delivery shortage / overage — over the current period.")
+        st.caption("Dip variance (physical vs book stock) measured against the allowable "
+                   "stock-loss standard, plus tanker delivery shortage / overage — current period.")
 
         def render_var(rp):
-            tg = compute_targets(df, rp, base_s, base_e, cur_s, cur_e)
-            vv = compute_variance(df, rp, tg, cur_s, cur_e, STANDARD[rp])
+            vv = compute_variance(df, rp, pd.DataFrame(), cur_s, cur_e, STANDARD[rp])
             if vv.empty:
                 st.info("No variance data.")
                 return
@@ -1009,13 +1008,14 @@ def main():
             st.markdown(f"<div class='note'>Allowable stock loss for {rp}: "
                         f"<b>{std:.2f}%</b> of throughput · within standard: <b>{n_ok}</b> · "
                         f"exceeding: <b>{n_bad}</b>.</div>", unsafe_allow_html=True)
+            wcolor = ["#1F9D57" if w is True else "#7A0010" if w is False
+                      else "rgba(140,140,140,.5)" for w in vv["within_standard"]]
             c1, c2 = st.columns(2, gap="large")
             with c1:
-                fig = px.bar(vv, x="target_variance", y="station", orientation="h",
-                             title="Target variance (L)",
-                             labels={"target_variance": "Litres vs target", "station": ""})
-                fig.update_traces(marker_color=[PCOL[rp] if x >= 0 else "rgba(140,140,140,.5)"
-                                                for x in vv["target_variance"].fillna(0)])
+                fig = px.bar(vv, x="dip_variance", y="station", orientation="h",
+                             title="Dip variance (L) — physical vs book",
+                             labels={"dip_variance": "Physical − book (L)", "station": ""})
+                fig.update_traces(marker_color=wcolor)
                 fig.add_vline(x=0, line_color=INK)
                 st.plotly_chart(style_fig(fig, max(280, 32 * len(vv)), PCOL[rp]),
                                 use_container_width=True)
@@ -1038,16 +1038,13 @@ def main():
                 {True: "✓ within", False: "✗ exceeds"}).fillna("—")
             show = show.rename(columns={
                 "station": "Station", "throughput": "Throughput (L)",
-                "target_variance": "Target variance (L)", "target_var_pct": "Target var %",
                 "dip_variance": "Dip variance (L)", "stock_loss_pct": "Stock loss %",
                 "standard_pct": "Standard %", "loss_vs_standard": "Over by (pp)",
                 "within_standard": "Status", "delivery_shortage": "Delivery shortage (L)"})
-            cols = ["Station", "Throughput (L)", "Target variance (L)", "Target var %",
-                    "Dip variance (L)", "Stock loss %", "Standard %", "Over by (pp)",
-                    "Status", "Delivery shortage (L)"]
+            cols = ["Station", "Throughput (L)", "Dip variance (L)", "Stock loss %",
+                    "Standard %", "Over by (pp)", "Status", "Delivery shortage (L)"]
             st.dataframe(show[cols].style.format({
-                "Throughput (L)": "{:,.0f}", "Target variance (L)": "{:,.0f}",
-                "Target var %": "{:+.1f}%", "Dip variance (L)": "{:,.1f}",
+                "Throughput (L)": "{:,.0f}", "Dip variance (L)": "{:,.1f}",
                 "Stock loss %": "{:+.2f}%", "Standard %": "{:.2f}%",
                 "Over by (pp)": "{:+.2f}", "Delivery shortage (L)": "{:,.0f}"}, na_rep="—"),
                 use_container_width=True, hide_index=True)
