@@ -635,6 +635,94 @@ def default_windows(dmin, dmax):
     return (bs, be), (cs, ce)
 
 
+# ─────────────────────── forecast / alerts / export engine ─────────────────
+def forecast_month_end(df, product, targets_df, cur_e):
+    """Project each station's full-month volume from its month-to-date run-rate,
+    and whether it will hit its monthly target."""
+    cur_e = pd.Timestamp(cur_e)
+    mstart = pd.Timestamp(date(cur_e.year, cur_e.month, 1))
+    dim = cur_e.days_in_month
+    elapsed = (cur_e - mstart).days + 1
+    mtd = _slice(df, product, mstart, cur_e)
+    tmap = targets_df.set_index("station") if not targets_df.empty else None
+    out = []
+    for st in sorted(df["station"].unique()):
+        v = mtd[mtd["station"] == st]["volume"].dropna()
+        m = float(v.sum())
+        rate = m / elapsed if elapsed > 0 else np.nan
+        projected = rate * dim if not np.isnan(rate) else np.nan
+        target = float(tmap.loc[st, "monthly_target"]) if (tmap is not None and st in tmap.index) else np.nan
+        proj_attain = (projected / target * 100
+                       if (target and target > 0 and not np.isnan(projected)) else np.nan)
+        shortfall = (projected - target
+                     if (not np.isnan(target) and not np.isnan(projected)) else np.nan)
+        out.append({"station": st, "mtd": m, "daily_rate": rate, "projected": projected,
+                    "monthly_target": target, "proj_attain": proj_attain,
+                    "shortfall": shortfall,
+                    "will_hit": (proj_attain >= 100) if not np.isnan(proj_attain) else None,
+                    "elapsed": elapsed, "days_in_month": dim})
+    res = pd.DataFrame(out)
+    if not res.empty:
+        res = res.sort_values("proj_attain", na_position="last").reset_index(drop=True)
+    return res
+
+
+def forecast_series(frame, horizon=30, lookback=120):
+    """Trend + day-of-week seasonal forecast for a daily volume series.
+    Returns (history_df, forecast_df) or None if too little data."""
+    s = frame.dropna(subset=["volume"]).sort_values("date")
+    s = s[s["volume"] > 0]
+    if len(s) < 14:
+        return None
+    s = s.tail(lookback).copy()
+    s["t"] = (s["date"] - s["date"].min()).dt.days
+    b, a = np.polyfit(s["t"].values, s["volume"].values, 1)
+    base = s["volume"].mean()
+    dowf = (s.assign(dow=s["date"].dt.dayofweek).groupby("dow")["volume"].mean() / base).to_dict()
+    fitted = (a + b * s["t"]) * s["date"].dt.dayofweek.map(dowf).fillna(1.0)
+    resid = s["volume"].values - fitted.values
+    sd = float(np.std(resid)) if len(resid) > 2 else 0.0
+    last_t, last_d = s["t"].max(), s["date"].max()
+    rows = []
+    for h in range(1, horizon + 1):
+        d = last_d + pd.Timedelta(days=h)
+        f = max((a + b * (last_t + h)) * dowf.get(d.dayofweek, 1.0), 0.0)
+        rows.append({"date": d, "yhat": f, "lo": max(f - 1.28 * sd, 0), "hi": f + 1.28 * sd})
+    return s[["date", "volume"]], pd.DataFrame(rows)
+
+
+def volume_anomalies(df, product, lookback=45, z=3.0):
+    """Flag stations whose latest recorded day is a statistical outlier."""
+    end = df["date"].max()
+    start = end - pd.Timedelta(days=lookback)
+    out = []
+    for st in sorted(df["station"].unique()):
+        s = df[(df["product"] == product) & (df["station"] == st)].dropna(subset=["volume"])
+        s = s[s["volume"] > 0]
+        recent = s[s["date"] >= start]["volume"]
+        if len(recent) < 8:
+            continue
+        m, sd = recent.mean(), recent.std()
+        if not sd or sd == 0:
+            continue
+        last = s.sort_values("date").iloc[-1]
+        zz = (last["volume"] - m) / sd
+        if abs(zz) >= z:
+            out.append({"station": st, "date": last["date"], "volume": last["volume"],
+                        "z": zz, "mean": m})
+    return pd.DataFrame(out)
+
+
+def build_excel(sheets):
+    """sheets: dict name -> DataFrame. Returns xlsx bytes."""
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as xw:
+        for name, d in sheets.items():
+            dd = d if (isinstance(d, pd.DataFrame) and not d.empty) else pd.DataFrame({"info": ["no data"]})
+            dd.to_excel(xw, sheet_name=str(name)[:31], index=False)
+    return bio.getvalue()
+
+
 # ─────────────────────────────────── theme ─────────────────────────────────
 CSS = """
 <style>
@@ -1008,7 +1096,7 @@ def main():
 
     f0 = lambda x: "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:,.0f}"
     tabs = st.tabs(["Overview", "Targets vs Actual", "Price Sensitivity", "Days to Run Out",
-                    "Efficiency", "Variance", "Rankings", "Trends"])
+                    "Efficiency", "Variance", "Rankings", "🔮 Forecast", "🚨 Alerts", "Trends"])
 
     # ============================ OVERVIEW ============================
     with tabs[0]:
@@ -1210,6 +1298,52 @@ def main():
                         "Volume Δ%": "{:+.1f}%", "Arc elasticity": "{:.2f}"}, na_rep="—"),
                         use_container_width=True, hide_index=True)
 
+                # ---- what-if price → revenue simulator ----
+                sd = df[(df["product"] == rp) & (df["station"] == focus)].dropna(subset=["price", "volume"])
+                sd = sd[(sd["price"] > 0) & (sd["volume"] > 0)]
+                if len(sd) >= 4 and sd["price"].nunique() >= 2:
+                    st.markdown("<div class='eyebrow'>What-if price → revenue</div>",
+                                unsafe_allow_html=True)
+                    b, a = np.polyfit(sd["price"].values, sd["volume"].values, 1)   # Q = a + bP
+                    p_cur = float(sd.sort_values("date")["price"].iloc[-1])
+                    q_cur = max(a + b * p_cur, 0.0)
+                    prop = st.number_input(f"Proposed price (GHS/L) — {rp}", min_value=0.0,
+                                           value=round(p_cur, 2), step=0.10, key=f"sim_{rp}")
+                    q_prop = max(a + b * prop, 0.0)
+                    rev_cur, rev_prop = p_cur * q_cur, prop * q_prop
+                    drev = (rev_prop - rev_cur) / rev_cur * 100 if rev_cur else np.nan
+                    cc = st.columns(3)
+                    cc[0].metric("Predicted volume", f"{q_prop:,.0f} L/day",
+                                 f"{(q_prop-q_cur)/q_cur*100:+.0f}%" if q_cur else None)
+                    cc[1].metric("Predicted revenue", f"GHS {rev_prop:,.0f}/day",
+                                 None if np.isnan(drev) else f"{drev:+.0f}%")
+                    if b < 0:
+                        p_opt = -a / (2 * b)
+                        q_opt = max(a + b * p_opt, 0.0)
+                        cc[2].metric("Revenue-max price", f"GHS {p_opt:,.2f}",
+                                     f"GHS {p_opt*q_opt:,.0f}/day")
+                        xs = np.linspace(max(sd["price"].min() * 0.9, 0.1), sd["price"].max() * 1.1, 60)
+                        rev = xs * np.clip(a + b * xs, 0, None)
+                        fig = go.Figure()
+                        fig.add_scatter(x=xs, y=rev, mode="lines", name="Revenue",
+                                        line=dict(color=acc, width=2.5))
+                        fig.add_vline(x=p_opt, line_dash="dash", line_color="#1F9D57",
+                                      annotation_text="rev-max")
+                        fig.add_vline(x=p_cur, line_dash="dot", line_color=INK,
+                                      annotation_text="current")
+                        fig.add_scatter(x=[prop], y=[rev_prop], mode="markers", name="Proposed",
+                                        marker=dict(color="#E23744", size=13))
+                        fig.update_layout(title="Daily revenue vs price")
+                        fig.update_xaxes(title_text="Price (GHS/L)")
+                        fig.update_yaxes(title_text="Revenue (GHS/day)")
+                        st.plotly_chart(style_fig(fig, 300, acc), use_container_width=True)
+                    else:
+                        cc[2].metric("Revenue-max price", "—", "no interior optimum")
+                        st.caption("Volume rose with price in this data (no downward demand curve), "
+                                   "so there's no interior revenue-maximising price — directional only.")
+                    st.caption("Modelled from the fitted demand curve; fuel prices may be regulated, "
+                               "so treat as a planning what-if.")
+
         for rp in real_products:
             if len(real_products) > 1:
                 phead(rp)
@@ -1399,8 +1533,145 @@ def main():
                 "Stock loss %": "{:+.2f}%", "Vol rank": "{:.0f}", "Attain rank": "{:.0f}"},
                 na_rep="—"), use_container_width=True, hide_index=True)
 
-    # ============================ TRENDS ============================
+    # ============================ FORECAST ============================
     with tabs[7]:
+        st.markdown("<div class='eyebrow'>Run-rate projection · current month</div>",
+                    unsafe_allow_html=True)
+        st.subheader(f"Will we hit target? — {PLABEL[product]}")
+        fc = forecast_month_end(df_all, product, targets, cur_e)
+        net_mtd = fc["mtd"].sum()
+        net_proj = fc["projected"].sum(skipna=True)
+        net_tgt = targets["monthly_target"].sum(skipna=True)
+        net_attain = net_proj / net_tgt * 100 if net_tgt else np.nan
+        elapsed = int(fc["elapsed"].iloc[0]) if len(fc) else 0
+        dim = int(fc["days_in_month"].iloc[0]) if len(fc) else 0
+        kpi_row([
+            ("Month-to-date", f0(net_mtd), "L", f"{elapsed} of {dim} days elapsed", accent),
+            ("Projected month-end", f0(net_proj), "L", "at current run-rate", accent),
+            ("Monthly target", f0(net_tgt), "L", "2× median month", accent),
+            ("Projected attainment", "—" if np.isnan(net_attain) else f"{net_attain:,.0f}", "%",
+             "on track" if (not np.isnan(net_attain) and net_attain >= 100) else "short of target",
+             accent),
+        ])
+        st.write("")
+        fp = fc.dropna(subset=["projected"]).sort_values("proj_attain")
+        if not fp.empty:
+            fig = go.Figure()
+            fig.add_bar(y=fp["station"], x=fp["monthly_target"], orientation="h", name="Target",
+                        marker_color="rgba(140,140,140,.30)")
+            fig.add_bar(y=fp["station"], x=fp["projected"], orientation="h", name="Projected",
+                        marker_color=["#1F9D57" if w else "#E23744"
+                                      for w in fp["will_hit"].fillna(False)],
+                        text=["—" if np.isnan(a) else f"{a:.0f}%" for a in fp["proj_attain"]],
+                        textposition="outside", textfont=dict(color=INK, size=11), cliponaxis=False)
+            fig.update_layout(barmode="group",
+                              title="Projected month-end vs target (green = on track to hit)")
+            st.plotly_chart(style_fig(fig, max(300, 34 * len(fp)), accent), use_container_width=True)
+        show = fc.rename(columns={
+            "station": "Station", "mtd": "MTD (L)", "daily_rate": "Daily rate (L)",
+            "projected": "Projected month-end (L)", "monthly_target": "Target (L)",
+            "proj_attain": "Proj. attainment %", "shortfall": "Proj. gap (L)"})
+        cols = ["Station", "MTD (L)", "Daily rate (L)", "Projected month-end (L)",
+                "Target (L)", "Proj. attainment %", "Proj. gap (L)"]
+        st.dataframe(show[cols].style.format({
+            "MTD (L)": "{:,.0f}", "Daily rate (L)": "{:,.0f}", "Projected month-end (L)": "{:,.0f}",
+            "Target (L)": "{:,.0f}", "Proj. attainment %": "{:,.0f}%", "Proj. gap (L)": "{:,.0f}"},
+            na_rep="—"), use_container_width=True, hide_index=True)
+
+        st.markdown("<div class='eyebrow'>30-day demand outlook</div>", unsafe_allow_html=True)
+        st.caption("Trend + day-of-week seasonality with an 80% confidence band. "
+                   + ("Network total." if focus == "All stations" else f"{focus}."))
+        if focus == "All stations":
+            ser = (df_all[df_all["product"] == product].groupby("date", as_index=False)
+                   .agg(volume=("volume", "sum")))
+        else:
+            ser = df_all[(df_all["product"] == product) & (df_all["station"] == focus)][
+                ["date", "volume"]]
+        res = forecast_series(ser)
+        if res is None:
+            st.caption("Not enough history for a forecast here.")
+        else:
+            hist, fcast = res
+            fig = go.Figure()
+            fig.add_scatter(x=fcast["date"], y=fcast["hi"], line=dict(width=0),
+                            showlegend=False, hoverinfo="skip")
+            fig.add_scatter(x=fcast["date"], y=fcast["lo"], fill="tonexty", fillcolor=PSTEP[product],
+                            line=dict(width=0), name="80% band")
+            fig.add_scatter(x=hist["date"], y=hist["volume"], mode="lines", name="History",
+                            line=dict(color="rgba(140,140,140,.75)", width=1.5))
+            fig.add_scatter(x=fcast["date"], y=fcast["yhat"], mode="lines", name="Forecast",
+                            line=dict(color=accent, width=2.6))
+            fig.update_layout(title="Daily volume — history & 30-day forecast")
+            fig.update_yaxes(title_text="L/day")
+            st.plotly_chart(style_fig(fig, 340, accent), use_container_width=True)
+
+    # ============================ ALERTS ============================
+    with tabs[8]:
+        st.markdown("<div class='eyebrow'>Exceptions across the network</div>",
+                    unsafe_allow_html=True)
+        st.subheader("Alerts")
+        SEV = {1: "🔴 High", 2: "🟠 Medium", 3: "🟡 Low"}
+        alerts = []
+        for rp in real_products:
+            for _, r in runway_all[runway_all["product"] == rp].iterrows():
+                if r["risk"] == "critical":
+                    alerts.append((1, "Stock-out", rp, r["station"],
+                                   f"~{r['days_to_run_out']:.1f} days of cover — refill now"))
+                elif r["risk"] == "low":
+                    alerts.append((2, "Stock-out", rp, r["station"],
+                                   f"~{r['days_to_run_out']:.1f} days of cover"))
+            tg = compute_targets(df_all, rp, base_s, base_e, cur_s, cur_e)
+            for _, r in forecast_month_end(df_all, rp, tg, cur_e).iterrows():
+                pa = r["proj_attain"]
+                if not np.isnan(pa) and pa < 70:
+                    alerts.append((2, "Off target", rp, r["station"],
+                                   f"projected {pa:.0f}% of monthly target"))
+                elif not np.isnan(pa) and pa < 90:
+                    alerts.append((3, "Off target", rp, r["station"],
+                                   f"projected {pa:.0f}% of monthly target"))
+            for _, r in compute_variance(df, rp, pd.DataFrame(), cur_s, cur_e, STANDARD[rp]).iterrows():
+                if r["within_standard"] == False:  # noqa: E712
+                    alerts.append((2, "Stock loss", rp, r["station"],
+                                   f"loss {r['abs_loss_pct']:.2f}% exceeds {STANDARD[rp]:.2f}% standard"))
+            for _, r in volume_anomalies(df, rp).iterrows():
+                d = "spike" if r["z"] > 0 else "drop"
+                alerts.append((2, "Anomaly", rp, r["station"],
+                               f"{pd.Timestamp(r['date']).strftime('%d %b')} volume {d} ({r['z']:+.1f}σ)"))
+        cb = compute_banking(banking_frame(df))
+        if not cb.empty:
+            thr = max(cb["outstanding"].quantile(0.75), 1)
+            for _, r in cb.iterrows():
+                o = r["outstanding"]
+                if not np.isnan(o) and o > 0 and o >= thr:
+                    sev = 1 if (np.isnan(r["banking_rate"]) or r["banking_rate"] < 50) else 2
+                    alerts.append((sev, "Unbanked cash", "—", r["station"],
+                                   f"GHS {o:,.0f} unbanked"))
+        if not alerts:
+            st.success("No active alerts — everything is within thresholds. ✅")
+        else:
+            adf = pd.DataFrame(alerts, columns=["sev", "Category", "Product", "Station", "Detail"])
+            adf = adf.sort_values("sev").reset_index(drop=True)
+            m1, m2, m3 = st.columns(3)
+            m1.metric("🔴 High", int((adf.sev == 1).sum()))
+            m2.metric("🟠 Medium", int((adf.sev == 2).sum()))
+            m3.metric("🟡 Low", int((adf.sev == 3).sum()))
+            adf["Severity"] = adf["sev"].map(SEV)
+            st.dataframe(adf[["Severity", "Category", "Product", "Station", "Detail"]],
+                         use_container_width=True, hide_index=True,
+                         height=min(600, 80 + 34 * len(adf)))
+        st.markdown("<div class='eyebrow'>Stakeholder report</div>", unsafe_allow_html=True)
+        try:
+            sheets = {"Targets": targets, "Forecast": fc,
+                      "Runway": runway_all, "Rankings": rankings,
+                      "Banking": cb}
+            st.download_button("⬇ Download executive report (Excel)", build_excel(sheets),
+                               "spartan_executive_report.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception as e:
+            st.caption(f"Report export unavailable: {e}")
+
+    # ============================ TRENDS ============================
+    with tabs[9]:
         st.markdown("<div class='eyebrow'>Full history</div>", unsafe_allow_html=True)
         st.subheader(f"Trends — {PLABEL[product]} · {focus}")
         fig = make_subplots(specs=[[{"secondary_y": True}]])
