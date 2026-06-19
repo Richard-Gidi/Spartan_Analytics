@@ -451,34 +451,40 @@ def compute_efficiency(df, product, exclude_zero=EXCLUDE_ZERO):
 
 
 def compute_variance(df, product, targets_df, cur_start, cur_end, std_lpd=10.0):
-    """Dip variance (PMS Dv / AGO Dv) vs an allowable standard of std_lpd litres
-    per day. Allowable over the period = std_lpd × days measured. Percentage
-    columns (variance % of throughput, standard % of avg daily throughput) are
-    supplementary."""
-    cur = _slice(df, product, cur_start, cur_end)
+    """True dip / wet-stock variance, computed from physical stock movement:
+        daily variance = closing dip − prior dip + sales − deliveries
+    (i.e. actual dip vs what the book expects). This is summed for the period to
+    get the real total loss/gain — more reliable than the sheet's PMS Dv / AGO Dv
+    column, which under-reports on post-delivery days because the book is reset to
+    the dip. Judged per day against std_lpd litres/day; percentages are supplementary."""
+    sub = df[df["product"] == product].sort_values(["station", "date"]).copy()
+    sub["prev_dip"] = sub.groupby("station")["dip"].shift(1)
+    sub["daily_var"] = (sub["dip"] - sub["prev_dip"]
+                        + sub["volume"].fillna(0) - sub["discharge"].fillna(0))
+    sub.loc[sub["dip"].isna() | sub["prev_dip"].isna(), "daily_var"] = np.nan
+    cur = sub[(sub["date"] >= cur_start) & (sub["date"] <= cur_end)]
     out = []
     for st in sorted(df["station"].unique()):
         cs = cur[cur["station"] == st]
-        throughput = float(cs["volume"].dropna().sum())
-        dv = cs["dip_var"].dropna()
+        dv = cs["daily_var"].dropna()
         days = int(dv.shape[0])
-        dip_variance = float(dv.sum())
-        avg_daily_var = dip_variance / days if days else np.nan
-        allowable = std_lpd * days if days else np.nan
-        within = (abs(avg_daily_var) <= std_lpd) if (days and not np.isnan(avg_daily_var)) else None
-        over_by = (abs(avg_daily_var) - std_lpd) if (days and not np.isnan(avg_daily_var)) else np.nan
+        total_var = float(dv.sum()) if days else np.nan
+        avg_daily = total_var / days if days else np.nan
+        throughput = float(cs["volume"].dropna().sum())
+        avg_thru = (throughput / days) if days else np.nan
+        within = (abs(avg_daily) <= std_lpd) if (days and not np.isnan(avg_daily)) else None
+        over_by = (abs(avg_daily) - std_lpd) if (days and not np.isnan(avg_daily)) else np.nan
         days_over = int((dv.abs() > std_lpd).sum()) if days else 0
-        avg_daily_thru = (throughput / days) if days else np.nan
-        var_pct = (avg_daily_var / avg_daily_thru * 100) if (avg_daily_thru and avg_daily_thru > 0
-                  and not np.isnan(avg_daily_var)) else np.nan
-        cum_pct = (dip_variance / throughput * 100) if throughput else np.nan
-        std_pct = (std_lpd / avg_daily_thru * 100) if (avg_daily_thru and avg_daily_thru > 0) else np.nan
+        var_pct = (avg_daily / avg_thru * 100) if (avg_thru and avg_thru > 0
+                  and not np.isnan(avg_daily)) else np.nan
+        cum_pct = (total_var / throughput * 100) if (throughput and not np.isnan(total_var)) else np.nan
+        std_pct = (std_lpd / avg_thru * 100) if (avg_thru and avg_thru > 0) else np.nan
         shortage = float(cs["shortage"].dropna().sum())
         out.append({"station": st, "throughput": throughput, "days": days,
-                    "dip_variance": dip_variance, "avg_daily_var": avg_daily_var,
-                    "days_over": days_over, "allowable": allowable, "over_by": over_by,
-                    "var_pct": var_pct, "stock_loss_pct": cum_pct, "std_pct": std_pct,
-                    "within_standard": within, "delivery_shortage": shortage})
+                    "dip_variance": total_var, "avg_daily_var": avg_daily,
+                    "days_over": days_over, "allowable": std_lpd * days if days else np.nan,
+                    "over_by": over_by, "var_pct": var_pct, "stock_loss_pct": cum_pct,
+                    "std_pct": std_pct, "within_standard": within, "delivery_shortage": shortage})
     return pd.DataFrame(out)
 
 
@@ -1445,9 +1451,11 @@ def main():
     with tabs[5]:
         st.markdown("<div class='eyebrow'>Dip variance · vs 10 L/day standard</div>",
                     unsafe_allow_html=True)
-        st.caption("Dip variance is the PMS Dv / AGO Dv reading, judged per day against a "
-                   "10 litres/day standard (the headline is the average L/day, not the running "
-                   "total). Percentage columns are supplementary. Plus delivery shortage — current period.")
+        st.caption("Dip variance = closing dip − opening dip + sales − deliveries (true wet-stock "
+                   "loss/gain), not the sheet's PMS Dv / AGO Dv column, which under-reports because "
+                   "the book is reset to the dip after deliveries. Total is the real period loss; "
+                   "the headline judges the average L/day against a 10 L/day standard. "
+                   "Percentage columns are supplementary.")
 
         def render_var(rp):
             vv = compute_variance(df, rp, pd.DataFrame(), cur_s, cur_e, STANDARD[rp])
