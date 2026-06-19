@@ -36,7 +36,7 @@ RANK_W_ATTAIN      = 0.40
 RANK_W_VOLUME      = 0.35
 RANK_W_DISCIPLINE  = 0.25
 EXCLUDE_ZERO       = True
-STANDARD = {"PMS": 0.32, "AGO": 0.25}            # allowable stock-loss % of throughput
+STANDARD = {"PMS": 10.0, "AGO": 10.0}            # allowable dip variance, LITRES PER DAY per station
 
 PCOL  = {"PMS": "#E23744", "AGO": "#1F9D57", "BOTH": "#3A6EA5"}
 PSTEP = {"PMS": "rgba(226,55,68,.22)", "AGO": "rgba(31,157,87,.22)", "BOTH": "rgba(58,110,165,.22)"}
@@ -450,31 +450,32 @@ def compute_efficiency(df, product, exclude_zero=EXCLUDE_ZERO):
     return res
 
 
-def compute_variance(df, product, targets_df, cur_start, cur_end, standard=None):
+def compute_variance(df, product, targets_df, cur_start, cur_end, std_lpd=10.0):
+    """Dip variance (PMS Dv / AGO Dv) vs an allowable standard of std_lpd litres
+    per day. Allowable over the period = std_lpd × days measured. Percentage
+    columns (variance % of throughput, standard % of avg daily throughput) are
+    supplementary."""
     cur = _slice(df, product, cur_start, cur_end)
-    tmap = targets_df.set_index("station") if not targets_df.empty else None
     out = []
     for st in sorted(df["station"].unique()):
         cs = cur[cur["station"] == st]
         throughput = float(cs["volume"].dropna().sum())
-        dip_var = float(cs["dip_var"].dropna().sum())
+        dv = cs["dip_var"].dropna()
+        days = int(dv.shape[0])
+        dip_variance = float(dv.sum())
+        avg_daily_var = dip_variance / days if days else np.nan
+        allowable = std_lpd * days if days else np.nan
+        within = (abs(dip_variance) <= allowable) if days else None
+        over_by = (abs(dip_variance) - allowable) if days else np.nan
+        var_pct = (dip_variance / throughput * 100) if throughput else np.nan
+        avg_daily_thru = (throughput / days) if days else np.nan
+        std_pct = (std_lpd / avg_daily_thru * 100) if (avg_daily_thru and avg_daily_thru > 0) else np.nan
         shortage = float(cs["shortage"].dropna().sum())
-        tgt_var = tgt_var_pct = np.nan
-        if tmap is not None and st in tmap.index:
-            tgt_var = tmap.loc[st, "gap_litres"]
-            tt = tmap.loc[st, "monthly_target"]
-            if tt and not np.isnan(tt) and tt != 0:
-                tgt_var_pct = tgt_var / tt * 100
-        loss_pct = (dip_var / throughput * 100) if throughput else np.nan
-        abs_loss = abs(loss_pct) if not np.isnan(loss_pct) else np.nan
-        within = (abs_loss <= standard) if (standard is not None and not np.isnan(abs_loss)) else None
-        vs_std = (abs_loss - standard) if (standard is not None and not np.isnan(abs_loss)) else np.nan
-        out.append({"station": st, "throughput": throughput,
-                    "target_variance": tgt_var, "target_var_pct": tgt_var_pct,
-                    "dip_variance": dip_var, "stock_loss_pct": loss_pct,
-                    "abs_loss_pct": abs_loss, "standard_pct": standard,
-                    "within_standard": within, "loss_vs_standard": vs_std,
-                    "delivery_shortage": shortage})
+        out.append({"station": st, "throughput": throughput, "days": days,
+                    "dip_variance": dip_variance, "avg_daily_var": avg_daily_var,
+                    "allowable": allowable, "over_by": over_by,
+                    "stock_loss_pct": var_pct, "std_pct": std_pct,
+                    "within_standard": within, "delivery_shortage": shortage})
     return pd.DataFrame(out)
 
 
@@ -1439,10 +1440,11 @@ def main():
 
     # ============================ VARIANCE ============================
     with tabs[5]:
-        st.markdown("<div class='eyebrow'>Stock & delivery control · vs standard</div>",
+        st.markdown("<div class='eyebrow'>Dip variance · vs 10 L/day standard</div>",
                     unsafe_allow_html=True)
-        st.caption("Dip variance (physical vs book stock) measured against the allowable "
-                   "stock-loss standard, plus tanker delivery shortage / overage — current period.")
+        st.caption("Dip variance is the PMS Dv / AGO Dv reading. Allowable standard is "
+                   "10 litres per day per station (so 10 × days over the period); the percentage "
+                   "columns are supplementary. Plus tanker delivery shortage / overage — current period.")
 
         def render_var(rp):
             vv = compute_variance(df, rp, pd.DataFrame(), cur_s, cur_e, STANDARD[rp])
@@ -1453,48 +1455,53 @@ def main():
             within = vv["within_standard"]
             n_ok = int((within == True).sum())
             n_bad = int((within == False).sum())
-            st.markdown(f"<div class='note'>Allowable stock loss for {rp}: "
-                        f"<b>{std:.2f}%</b> of throughput · within standard: <b>{n_ok}</b> · "
-                        f"exceeding: <b>{n_bad}</b>.</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='note'>Allowable dip variance: <b>{std:.0f} L/day</b> per station "
+                        f"· within: <b>{n_ok}</b> · exceeding: <b>{n_bad}</b>.</div>",
+                        unsafe_allow_html=True)
             wcolor = ["#1F9D57" if w is True else "#7A0010" if w is False
                       else "rgba(140,140,140,.5)" for w in vv["within_standard"]]
             c1, c2 = st.columns(2, gap="large")
             with c1:
                 fig = px.bar(vv, x="dip_variance", y="station", orientation="h",
-                             title="Dip variance (L) — physical vs book",
-                             labels={"dip_variance": "Physical − book (L)", "station": ""})
+                             title="Cumulative dip variance (L) · PMS/AGO Dv",
+                             labels={"dip_variance": "Variance (L)", "station": ""})
                 fig.update_traces(marker_color=wcolor)
                 fig.add_vline(x=0, line_color=INK)
                 st.plotly_chart(style_fig(fig, max(280, 32 * len(vv)), PCOL[rp]),
                                 use_container_width=True)
             with c2:
-                vp = vv.dropna(subset=["abs_loss_pct"])
+                vp = vv.dropna(subset=["avg_daily_var"])
                 if not vp.empty:
-                    fig = px.bar(vp, x="abs_loss_pct", y="station", orientation="h",
-                                 title=f"Stock loss % vs {std:.2f}% standard",
-                                 labels={"abs_loss_pct": "Stock loss % of throughput", "station": ""})
+                    fig = px.bar(vp, x="avg_daily_var", y="station", orientation="h",
+                                 title=f"Avg daily variance (L) vs ±{std:.0f} L/day",
+                                 labels={"avg_daily_var": "Litres per day", "station": ""})
                     fig.update_traces(
-                        marker_color=["#7A0010" if a > std else "#1F9D57" for a in vp["abs_loss_pct"]],
-                        text=[f"{a:.2f}%" for a in vp["abs_loss_pct"]], textposition="outside",
+                        marker_color=["#7A0010" if abs(a) > std else "#1F9D57"
+                                      for a in vp["avg_daily_var"]],
+                        text=[f"{a:.1f}" for a in vp["avg_daily_var"]], textposition="outside",
                         textfont=dict(color=INK, size=11), cliponaxis=False)
                     fig.add_vline(x=std, line_dash="dash", line_color=INK,
-                                  annotation_text=f"{std:.2f}% standard")
+                                  annotation_text=f"+{std:.0f}")
+                    fig.add_vline(x=-std, line_dash="dash", line_color=INK,
+                                  annotation_text=f"-{std:.0f}")
                     st.plotly_chart(style_fig(fig, max(280, 32 * len(vp)), PCOL[rp]),
                                     use_container_width=True)
             show = vv.copy()
             show["within_standard"] = show["within_standard"].map(
                 {True: "✓ within", False: "✗ exceeds"}).fillna("—")
             show = show.rename(columns={
-                "station": "Station", "throughput": "Throughput (L)",
-                "dip_variance": "Dip variance (L)", "stock_loss_pct": "Stock loss %",
-                "standard_pct": "Standard %", "loss_vs_standard": "Over by (pp)",
+                "station": "Station", "throughput": "Throughput (L)", "days": "Days",
+                "dip_variance": "Dip variance (L)", "avg_daily_var": "Avg/day (L)",
+                "allowable": "Allowable (L)", "over_by": "Over by (L)",
+                "stock_loss_pct": "Variance %", "std_pct": "Standard %",
                 "within_standard": "Status", "delivery_shortage": "Delivery shortage (L)"})
-            cols = ["Station", "Throughput (L)", "Dip variance (L)", "Stock loss %",
-                    "Standard %", "Over by (pp)", "Status", "Delivery shortage (L)"]
+            cols = ["Station", "Throughput (L)", "Days", "Dip variance (L)", "Avg/day (L)",
+                    "Allowable (L)", "Over by (L)", "Variance %", "Standard %", "Status",
+                    "Delivery shortage (L)"]
             st.dataframe(show[cols].style.format({
-                "Throughput (L)": "{:,.0f}", "Dip variance (L)": "{:,.1f}",
-                "Stock loss %": "{:+.2f}%", "Standard %": "{:.2f}%",
-                "Over by (pp)": "{:+.2f}", "Delivery shortage (L)": "{:,.0f}"}, na_rep="—"),
+                "Throughput (L)": "{:,.0f}", "Dip variance (L)": "{:,.1f}", "Avg/day (L)": "{:,.1f}",
+                "Allowable (L)": "{:,.0f}", "Over by (L)": "{:,.1f}", "Variance %": "{:+.2f}%",
+                "Standard %": "{:.2f}%", "Delivery shortage (L)": "{:,.0f}"}, na_rep="—"),
                 use_container_width=True, hide_index=True)
 
         for rp in real_products:
@@ -1631,8 +1638,8 @@ def main():
                                    f"projected {pa:.0f}% of monthly target"))
             for _, r in compute_variance(df, rp, pd.DataFrame(), cur_s, cur_e, STANDARD[rp]).iterrows():
                 if r["within_standard"] == False:  # noqa: E712
-                    alerts.append((2, "Stock loss", rp, r["station"],
-                                   f"loss {r['abs_loss_pct']:.2f}% exceeds {STANDARD[rp]:.2f}% standard"))
+                    alerts.append((2, "Dip variance", rp, r["station"],
+                                   f"avg {r['avg_daily_var']:+.1f} L/day exceeds ±{STANDARD[rp]:.0f} L/day"))
             for _, r in volume_anomalies(df, rp).iterrows():
                 d = "spike" if r["z"] > 0 else "drop"
                 alerts.append((2, "Anomaly", rp, r["station"],
