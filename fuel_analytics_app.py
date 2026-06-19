@@ -465,16 +465,19 @@ def compute_variance(df, product, targets_df, cur_start, cur_end, std_lpd=10.0):
         dip_variance = float(dv.sum())
         avg_daily_var = dip_variance / days if days else np.nan
         allowable = std_lpd * days if days else np.nan
-        within = (abs(dip_variance) <= allowable) if days else None
-        over_by = (abs(dip_variance) - allowable) if days else np.nan
-        var_pct = (dip_variance / throughput * 100) if throughput else np.nan
+        within = (abs(avg_daily_var) <= std_lpd) if (days and not np.isnan(avg_daily_var)) else None
+        over_by = (abs(avg_daily_var) - std_lpd) if (days and not np.isnan(avg_daily_var)) else np.nan
+        days_over = int((dv.abs() > std_lpd).sum()) if days else 0
         avg_daily_thru = (throughput / days) if days else np.nan
+        var_pct = (avg_daily_var / avg_daily_thru * 100) if (avg_daily_thru and avg_daily_thru > 0
+                  and not np.isnan(avg_daily_var)) else np.nan
+        cum_pct = (dip_variance / throughput * 100) if throughput else np.nan
         std_pct = (std_lpd / avg_daily_thru * 100) if (avg_daily_thru and avg_daily_thru > 0) else np.nan
         shortage = float(cs["shortage"].dropna().sum())
         out.append({"station": st, "throughput": throughput, "days": days,
                     "dip_variance": dip_variance, "avg_daily_var": avg_daily_var,
-                    "allowable": allowable, "over_by": over_by,
-                    "stock_loss_pct": var_pct, "std_pct": std_pct,
+                    "days_over": days_over, "allowable": allowable, "over_by": over_by,
+                    "var_pct": var_pct, "stock_loss_pct": cum_pct, "std_pct": std_pct,
                     "within_standard": within, "delivery_shortage": shortage})
     return pd.DataFrame(out)
 
@@ -1442,9 +1445,9 @@ def main():
     with tabs[5]:
         st.markdown("<div class='eyebrow'>Dip variance · vs 10 L/day standard</div>",
                     unsafe_allow_html=True)
-        st.caption("Dip variance is the PMS Dv / AGO Dv reading. Allowable standard is "
-                   "10 litres per day per station (so 10 × days over the period); the percentage "
-                   "columns are supplementary. Plus tanker delivery shortage / overage — current period.")
+        st.caption("Dip variance is the PMS Dv / AGO Dv reading, judged per day against a "
+                   "10 litres/day standard (the headline is the average L/day, not the running "
+                   "total). Percentage columns are supplementary. Plus delivery shortage — current period.")
 
         def render_var(rp):
             vv = compute_variance(df, rp, pd.DataFrame(), cur_s, cur_e, STANDARD[rp])
@@ -1455,53 +1458,53 @@ def main():
             within = vv["within_standard"]
             n_ok = int((within == True).sum())
             n_bad = int((within == False).sum())
-            st.markdown(f"<div class='note'>Allowable dip variance: <b>{std:.0f} L/day</b> per station "
+            st.markdown(f"<div class='note'>Standard: <b>{std:.0f} L/day</b> per station "
                         f"· within: <b>{n_ok}</b> · exceeding: <b>{n_bad}</b>.</div>",
                         unsafe_allow_html=True)
-            wcolor = ["#1F9D57" if w is True else "#7A0010" if w is False
-                      else "rgba(140,140,140,.5)" for w in vv["within_standard"]]
             c1, c2 = st.columns(2, gap="large")
             with c1:
-                fig = px.bar(vv, x="dip_variance", y="station", orientation="h",
-                             title="Cumulative dip variance (L) · PMS/AGO Dv",
-                             labels={"dip_variance": "Variance (L)", "station": ""})
-                fig.update_traces(marker_color=wcolor)
-                fig.add_vline(x=0, line_color=INK)
-                st.plotly_chart(style_fig(fig, max(280, 32 * len(vv)), PCOL[rp]),
-                                use_container_width=True)
-            with c2:
-                vp = vv.dropna(subset=["avg_daily_var"])
+                vp = vv.dropna(subset=["avg_daily_var"]).sort_values("avg_daily_var")
                 if not vp.empty:
                     fig = px.bar(vp, x="avg_daily_var", y="station", orientation="h",
-                                 title=f"Avg daily variance (L) vs ±{std:.0f} L/day",
+                                 title=f"Avg dip variance per day (L) vs ±{std:.0f}",
                                  labels={"avg_daily_var": "Litres per day", "station": ""})
                     fig.update_traces(
                         marker_color=["#7A0010" if abs(a) > std else "#1F9D57"
                                       for a in vp["avg_daily_var"]],
                         text=[f"{a:.1f}" for a in vp["avg_daily_var"]], textposition="outside",
                         textfont=dict(color=INK, size=11), cliponaxis=False)
-                    fig.add_vline(x=std, line_dash="dash", line_color=INK,
-                                  annotation_text=f"+{std:.0f}")
-                    fig.add_vline(x=-std, line_dash="dash", line_color=INK,
-                                  annotation_text=f"-{std:.0f}")
+                    fig.add_vline(x=std, line_dash="dash", line_color=INK, annotation_text=f"+{std:.0f}")
+                    fig.add_vline(x=-std, line_dash="dash", line_color=INK, annotation_text=f"-{std:.0f}")
                     st.plotly_chart(style_fig(fig, max(280, 32 * len(vp)), PCOL[rp]),
+                                    use_container_width=True)
+            with c2:
+                vp2 = vv.dropna(subset=["days_over"])
+                if not vp2.empty:
+                    fig = px.bar(vp2.sort_values("days_over"), x="days_over", y="station",
+                                 orientation="h", title="Days over the 10 L/day standard",
+                                 labels={"days_over": "Days over standard", "station": ""})
+                    fig.update_traces(marker_color=PCOL[rp],
+                                      text=[f"{int(d)}/{int(n)}" for d, n in
+                                            zip(vp2.sort_values("days_over")["days_over"],
+                                                vp2.sort_values("days_over")["days"])],
+                                      textposition="outside", textfont=dict(color=INK, size=11),
+                                      cliponaxis=False)
+                    st.plotly_chart(style_fig(fig, max(280, 32 * len(vp2)), PCOL[rp]),
                                     use_container_width=True)
             show = vv.copy()
             show["within_standard"] = show["within_standard"].map(
                 {True: "✓ within", False: "✗ exceeds"}).fillna("—")
             show = show.rename(columns={
-                "station": "Station", "throughput": "Throughput (L)", "days": "Days",
-                "dip_variance": "Dip variance (L)", "avg_daily_var": "Avg/day (L)",
-                "allowable": "Allowable (L)", "over_by": "Over by (L)",
-                "stock_loss_pct": "Variance %", "std_pct": "Standard %",
+                "station": "Station", "days": "Days", "avg_daily_var": "Avg/day (L)",
+                "days_over": "Days over", "dip_variance": "Total variance (L)",
+                "var_pct": "Variance %/day", "std_pct": "Standard %/day",
                 "within_standard": "Status", "delivery_shortage": "Delivery shortage (L)"})
-            cols = ["Station", "Throughput (L)", "Days", "Dip variance (L)", "Avg/day (L)",
-                    "Allowable (L)", "Over by (L)", "Variance %", "Standard %", "Status",
-                    "Delivery shortage (L)"]
+            cols = ["Station", "Days", "Avg/day (L)", "Days over", "Total variance (L)",
+                    "Variance %/day", "Standard %/day", "Status", "Delivery shortage (L)"]
             st.dataframe(show[cols].style.format({
-                "Throughput (L)": "{:,.0f}", "Dip variance (L)": "{:,.1f}", "Avg/day (L)": "{:,.1f}",
-                "Allowable (L)": "{:,.0f}", "Over by (L)": "{:,.1f}", "Variance %": "{:+.2f}%",
-                "Standard %": "{:.2f}%", "Delivery shortage (L)": "{:,.0f}"}, na_rep="—"),
+                "Avg/day (L)": "{:+,.1f}", "Total variance (L)": "{:,.1f}",
+                "Variance %/day": "{:+.2f}%", "Standard %/day": "{:.2f}%",
+                "Delivery shortage (L)": "{:,.0f}"}, na_rep="—"),
                 use_container_width=True, hide_index=True)
 
         for rp in real_products:
