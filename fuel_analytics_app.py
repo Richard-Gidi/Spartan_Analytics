@@ -465,9 +465,10 @@ def compute_variance(df, product, targets_df, cur_start, cur_end, std_lpd=10.0):
         avg_daily = total_var / days if days else np.nan
         throughput = float(cs["volume"].dropna().sum())
         avg_thru = (throughput / days) if days else np.nan
-        within = (abs(avg_daily) <= std_lpd) if (days and not np.isnan(avg_daily)) else None
-        over_by = (abs(avg_daily) - std_lpd) if (days and not np.isnan(avg_daily)) else np.nan
-        days_over = int((dv.abs() > std_lpd).sum()) if days else 0
+        within = (avg_daily >= -std_lpd) if (days and not np.isnan(avg_daily)) else None
+        over_by = ((-avg_daily) - std_lpd) if (days and not np.isnan(avg_daily)
+                  and avg_daily < -std_lpd) else 0.0
+        days_over = int((dv < -std_lpd).sum()) if days else 0
         var_pct = (avg_daily / avg_thru * 100) if (avg_thru and avg_thru > 0
                   and not np.isnan(avg_daily)) else np.nan
         cum_pct = (total_var / throughput * 100) if (throughput and not np.isnan(total_var)) else np.nan
@@ -1446,7 +1447,9 @@ def main():
                     unsafe_allow_html=True)
         st.caption("Dip variance is taken from the sheet's PMS Dv / AGO Dv columns. The total is "
                    "the sum over the period; the headline judges the average L/day against a "
-                   "10 L/day standard, and the percentage columns are supplementary.")
+                   "10 L/day loss standard. A positive variance is a gain, so it always counts as "
+                   "within; only an average loss worse than 10 L/day is flagged. Percentage "
+                   "columns are supplementary.")
 
         def render_var(rp):
             vv = compute_variance(df, rp, pd.DataFrame(), cur_s, cur_e, STANDARD[rp])
@@ -1457,18 +1460,33 @@ def main():
             within = vv["within_standard"]
             n_ok = int((within == True).sum())
             n_bad = int((within == False).sum())
-            st.markdown(f"<div class='note'>Standard: <b>{std:.0f} L/day</b> per station "
-                        f"· within: <b>{n_ok}</b> · exceeding: <b>{n_bad}</b>.</div>",
-                        unsafe_allow_html=True)
+            st.markdown(f"<div class='note'>Total variance = sum of the sheet's {rp} Dv "
+                        f"(matches your Sheet2 VAR). Standard: <b>{std:.0f} L/day</b> "
+                        f"· within: <b>{n_ok}</b> · exceeding: <b>{n_bad}</b> "
+                        f"(a gain always counts as within).</div>", unsafe_allow_html=True)
             c1, c2 = st.columns(2, gap="large")
             with c1:
+                vt = vv.dropna(subset=["dip_variance"]).sort_values("dip_variance")
+                if not vt.empty:
+                    fig = px.bar(vt, x="dip_variance", y="station", orientation="h",
+                                 title=f"Total {rp} variance for the period (L)",
+                                 labels={"dip_variance": "Total variance (L)", "station": ""})
+                    fig.update_traces(
+                        marker_color=["#7A0010" if (a < 0 and abs(a) / max(d, 1) > std) else "#1F9D57"
+                                      for a, d in zip(vt["dip_variance"], vt["days"])],
+                        text=[f"{a:,.1f}" for a in vt["dip_variance"]], textposition="outside",
+                        textfont=dict(color=INK, size=11), cliponaxis=False)
+                    fig.add_vline(x=0, line_color=INK)
+                    st.plotly_chart(style_fig(fig, max(280, 32 * len(vt)), PCOL[rp]),
+                                    use_container_width=True)
+            with c2:
                 vp = vv.dropna(subset=["avg_daily_var"]).sort_values("avg_daily_var")
                 if not vp.empty:
                     fig = px.bar(vp, x="avg_daily_var", y="station", orientation="h",
-                                 title=f"Avg dip variance per day (L) vs ±{std:.0f}",
+                                 title=f"Avg per day (L) vs ±{std:.0f} standard",
                                  labels={"avg_daily_var": "Litres per day", "station": ""})
                     fig.update_traces(
-                        marker_color=["#7A0010" if abs(a) > std else "#1F9D57"
+                        marker_color=["#7A0010" if a < -std else "#1F9D57"
                                       for a in vp["avg_daily_var"]],
                         text=[f"{a:.1f}" for a in vp["avg_daily_var"]], textposition="outside",
                         textfont=dict(color=INK, size=11), cliponaxis=False)
@@ -1476,32 +1494,18 @@ def main():
                     fig.add_vline(x=-std, line_dash="dash", line_color=INK, annotation_text=f"-{std:.0f}")
                     st.plotly_chart(style_fig(fig, max(280, 32 * len(vp)), PCOL[rp]),
                                     use_container_width=True)
-            with c2:
-                vp2 = vv.dropna(subset=["days_over"])
-                if not vp2.empty:
-                    fig = px.bar(vp2.sort_values("days_over"), x="days_over", y="station",
-                                 orientation="h", title="Days over the 10 L/day standard",
-                                 labels={"days_over": "Days over standard", "station": ""})
-                    fig.update_traces(marker_color=PCOL[rp],
-                                      text=[f"{int(d)}/{int(n)}" for d, n in
-                                            zip(vp2.sort_values("days_over")["days_over"],
-                                                vp2.sort_values("days_over")["days"])],
-                                      textposition="outside", textfont=dict(color=INK, size=11),
-                                      cliponaxis=False)
-                    st.plotly_chart(style_fig(fig, max(280, 32 * len(vp2)), PCOL[rp]),
-                                    use_container_width=True)
             show = vv.copy()
             show["within_standard"] = show["within_standard"].map(
                 {True: "✓ within", False: "✗ exceeds"}).fillna("—")
             show = show.rename(columns={
-                "station": "Station", "days": "Days", "avg_daily_var": "Avg/day (L)",
-                "days_over": "Days over", "dip_variance": "Total variance (L)",
+                "station": "Station", "days": "Days", "dip_variance": "Total variance (L)",
+                "avg_daily_var": "Avg/day (L)", "days_over": "Days over",
                 "var_pct": "Variance %/day", "std_pct": "Standard %/day",
                 "within_standard": "Status", "delivery_shortage": "Delivery shortage (L)"})
-            cols = ["Station", "Days", "Avg/day (L)", "Days over", "Total variance (L)",
+            cols = ["Station", "Days", "Total variance (L)", "Avg/day (L)", "Days over",
                     "Variance %/day", "Standard %/day", "Status", "Delivery shortage (L)"]
             st.dataframe(show[cols].style.format({
-                "Avg/day (L)": "{:+,.1f}", "Total variance (L)": "{:,.1f}",
+                "Total variance (L)": "{:+,.1f}", "Avg/day (L)": "{:+,.1f}",
                 "Variance %/day": "{:+.2f}%", "Standard %/day": "{:.2f}%",
                 "Delivery shortage (L)": "{:,.0f}"}, na_rep="—"),
                 use_container_width=True, hide_index=True)
