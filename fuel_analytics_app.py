@@ -37,6 +37,7 @@ RANK_W_VOLUME      = 0.35
 RANK_W_DISCIPLINE  = 0.25
 EXCLUDE_ZERO       = True
 STANDARD = {"PMS": 10.0, "AGO": 10.0}            # allowable dip variance, LITRES PER DAY per station
+DELIVERY_CAP = 1000.0                            # a single-day Dv above this = unbooked delivery, excluded
 
 PCOL  = {"PMS": "#E23744", "AGO": "#1F9D57", "BOTH": "#3A6EA5"}
 PSTEP = {"PMS": "rgba(226,55,68,.22)", "AGO": "rgba(31,157,87,.22)", "BOTH": "rgba(58,110,165,.22)"}
@@ -450,20 +451,24 @@ def compute_efficiency(df, product, exclude_zero=EXCLUDE_ZERO):
     return res
 
 
-def compute_variance(df, product, targets_df, cur_start, cur_end, std_lpd=10.0):
-    """Dip variance taken directly from the sheet's PMS Dv / AGO Dv columns, summed
-    over the period for the total, and judged per day against std_lpd litres/day.
-    Percentage columns (per-day variance and standard as a % of daily throughput)
-    are supplementary."""
+def compute_variance(df, product, targets_df, cur_start, cur_end, std_lpd=10.0, cap=DELIVERY_CAP):
+    """Dip variance from the sheet's PMS Dv / AGO Dv columns, summed over the period
+    for the total and judged per day against std_lpd litres/day. Single-day Dv values
+    larger than `cap` litres are unbooked deliveries (a delivery raised the dip but
+    wasn't entered as a discharge), not stock variance, so they're excluded and
+    counted separately. Percentage columns are supplementary."""
     cur = _slice(df, product, cur_start, cur_end)
     out = []
     for st in sorted(df["station"].unique()):
         cs = cur[cur["station"] == st]
-        dv = cs["dip_var"].dropna()
+        dvall = cs["dip_var"].dropna()
+        anomaly_days = int((dvall.abs() > cap).sum())
+        keep = cs[cs["dip_var"].isna() | (cs["dip_var"].abs() <= cap)]
+        dv = keep["dip_var"].dropna()
         days = int(dv.shape[0])
         total_var = float(dv.sum()) if days else np.nan
         avg_daily = total_var / days if days else np.nan
-        throughput = float(cs["volume"].dropna().sum())
+        throughput = float(keep["volume"].dropna().sum())
         avg_thru = (throughput / days) if days else np.nan
         within = (abs(avg_daily) <= std_lpd) if (days and not np.isnan(avg_daily)) else None
         over_by = (abs(avg_daily) - std_lpd) if (days and not np.isnan(avg_daily)
@@ -476,7 +481,8 @@ def compute_variance(df, product, targets_df, cur_start, cur_end, std_lpd=10.0):
         shortage = float(cs["shortage"].dropna().sum())
         out.append({"station": st, "throughput": throughput, "days": days,
                     "dip_variance": total_var, "avg_daily_var": avg_daily,
-                    "days_over": days_over, "allowable": std_lpd * days if days else np.nan,
+                    "days_over": days_over, "anomaly_days": anomaly_days,
+                    "allowable": std_lpd * days if days else np.nan,
                     "over_by": over_by, "var_pct": var_pct, "stock_loss_pct": cum_pct,
                     "std_pct": std_pct, "within_standard": within, "delivery_shortage": shortage})
     return pd.DataFrame(out)
@@ -731,59 +737,127 @@ def build_excel(sheets):
 CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
-:root{--acc:#E23744;--muted:#8b9096;--line:rgba(140,140,140,.20);--card:rgba(140,140,140,.07);}
+:root{
+  --acc:#E23744;--muted:#8b9096;
+  --line:rgba(140,140,140,.18);--card:rgba(140,140,140,.06);--card2:rgba(140,140,140,.11);
+  --shadow:0 1px 2px rgba(0,0,0,.05),0 10px 26px rgba(0,0,0,.07);
+  --shadow-lg:0 22px 60px rgba(0,0,0,.24);--r:16px;
+}
 html,body,[class*="css"]{font-family:'Inter',sans-serif;}
-h1,h2,h3,h4{font-family:'Sora',sans-serif;letter-spacing:-.01em;}
-.block-container{padding-top:1.1rem;padding-bottom:3rem;max-width:1280px;}
-section[data-testid="stSidebar"]{border-right:1px solid var(--line);}
-.hero{background:linear-gradient(125deg,#11151B 0%,#222E37 100%);border-radius:20px;
-      padding:24px 28px;color:#fff;box-shadow:0 16px 44px rgba(0,0,0,.22);margin-bottom:16px;}
-.hero h1{color:#fff;font-size:24px;margin:0 0 5px;font-weight:800;line-height:1.15;}
-.hero .meta{color:#a7aeb7;font-family:'IBM Plex Mono',monospace;font-size:12px;line-height:1.5;}
-.hero .badge{display:inline-block;background:rgba(255,255,255,.13);border:1px solid rgba(255,255,255,.22);
-      color:#fff;border-radius:6px;padding:2px 9px;font-family:'IBM Plex Mono',monospace;
-      font-size:11px;letter-spacing:.12em;margin-left:8px;vertical-align:middle;}
-.summary{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--acc);
-      border-radius:14px;padding:14px 18px;line-height:1.6;font-size:15px;margin-bottom:16px;color:inherit;}
-.kpi-row{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:2px 0 6px;}
-.kpi{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px 16px 15px;
-      position:relative;overflow:hidden;color:inherit;}
-.kpi .l{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.1em;
-      text-transform:uppercase;color:var(--muted);}
-.kpi .v{font-family:'IBM Plex Mono',monospace;font-weight:600;font-size:27px;margin-top:9px;
-      line-height:1;font-variant-numeric:tabular-nums;color:inherit;}
-.kpi .v .u{font-size:12px;color:var(--muted);margin-left:4px;font-weight:500;}
-.kpi .s{font-size:11.5px;color:var(--muted);margin-top:7px;min-height:14px;}
-.kpi .tick{position:absolute;left:0;bottom:0;height:4px;width:100%;}
-.eyebrow{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.14em;
-      text-transform:uppercase;color:var(--acc);font-weight:600;margin:8px 0 -2px;}
-.stTabs [data-baseweb="tab-list"]{gap:5px;border-bottom:1px solid var(--line);flex-wrap:wrap;}
-.stTabs [data-baseweb="tab"]{padding:8px 14px;border-radius:10px 10px 0 0;
-      font-family:'Sora',sans-serif;font-weight:600;font-size:13px;}
-.stTabs [aria-selected="true"]{background:var(--acc);color:#fff!important;}
-.note{color:var(--muted);font-size:12px;font-family:'IBM Plex Mono',monospace;}
-.prodhead{font-family:'Sora',sans-serif;font-weight:700;font-size:16px;margin:10px 0 2px;
-      padding-left:10px;border-left:4px solid var(--acc2);}
+h1,h2,h3,h4{font-family:'Sora',sans-serif;letter-spacing:-.015em;}
+.block-container{padding-top:1.0rem;padding-bottom:3.5rem;max-width:1300px;}
+
+/* sidebar */
+section[data-testid="stSidebar"]{border-right:1px solid var(--line);
+  background:linear-gradient(180deg,rgba(140,140,140,.05),rgba(140,140,140,0));}
+section[data-testid="stSidebar"] h1,section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3,section[data-testid="stSidebar"] h4{font-size:12px;
+  text-transform:uppercase;letter-spacing:.14em;color:var(--muted);font-family:'IBM Plex Mono',monospace;}
+
+/* hero — forecourt at dusk */
+.hero{position:relative;overflow:hidden;border-radius:22px;padding:27px 30px;color:#fff;
+  background:linear-gradient(125deg,#0C1014 0%,#1A232C 58%,#222F3C 100%);
+  box-shadow:var(--shadow-lg);margin-bottom:18px;border:1px solid rgba(255,255,255,.06);}
+.hero::before{content:"";position:absolute;inset:0 0 auto 0;height:1px;
+  background:linear-gradient(90deg,transparent,var(--acc),transparent);opacity:.6;}
+.hero::after{content:"";position:absolute;left:-80px;top:-120px;width:420px;height:300px;
+  background:radial-gradient(circle,var(--acc),transparent 68%);opacity:.22;filter:blur(8px);}
+.hero h1{color:#fff;font-size:25px;margin:0 0 6px;font-weight:800;line-height:1.12;position:relative;}
+.hero .meta{color:#aab2bc;font-family:'IBM Plex Mono',monospace;font-size:12px;line-height:1.6;position:relative;}
+.hero .badge{display:inline-block;background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.20);
+  color:#fff;border-radius:999px;padding:3px 11px;font-family:'IBM Plex Mono',monospace;
+  font-size:10.5px;letter-spacing:.16em;margin-left:10px;vertical-align:middle;backdrop-filter:blur(6px);}
+
+/* readout strip */
+.summary{position:relative;background:linear-gradient(90deg,var(--card2),var(--card));
+  border:1px solid var(--line);border-radius:16px;padding:15px 18px 15px 22px;line-height:1.62;
+  font-size:14.5px;margin-bottom:18px;color:inherit;box-shadow:var(--shadow);}
+.summary::before{content:"";position:absolute;left:0;top:11px;bottom:11px;width:4px;border-radius:4px;
+  background:linear-gradient(180deg,var(--acc),transparent);}
+
+/* KPI tiles — instrument panel */
+.kpi-row{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:4px 0 8px;}
+.kpi{position:relative;overflow:hidden;background:var(--card);border:1px solid var(--line);
+  border-radius:var(--r);padding:16px 16px 18px;color:inherit;box-shadow:var(--shadow);
+  transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease;}
+.kpi:hover{transform:translateY(-3px);box-shadow:0 16px 38px rgba(0,0,0,.13);
+  border-color:rgba(140,140,140,.34);}
+.kpi .l{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--muted);}
+.kpi .v{font-family:'IBM Plex Mono',monospace;font-weight:600;font-size:29px;margin-top:10px;
+  line-height:1;font-variant-numeric:tabular-nums;color:inherit;}
+.kpi .v .u{font-size:12px;color:var(--muted);margin-left:5px;font-weight:500;}
+.kpi .s{font-size:11.5px;color:var(--muted);margin-top:8px;min-height:14px;}
+.kpi .tick{position:absolute;left:0;bottom:0;height:4px;width:100%;
+  background:linear-gradient(90deg,var(--acc),transparent)!important;opacity:.95;}
+
+/* eyebrow + section heads */
+.eyebrow{display:flex;align-items:center;gap:9px;font-family:'IBM Plex Mono',monospace;font-size:11px;
+  letter-spacing:.15em;text-transform:uppercase;color:var(--acc);font-weight:600;margin:16px 0 3px;}
+.eyebrow::before{content:"";width:16px;height:2px;background:var(--acc);border-radius:2px;
+  display:inline-block;box-shadow:0 0 8px var(--acc);}
+.block-container h2,.block-container h3{font-weight:700;}
+.prodhead{font-family:'Sora',sans-serif;font-weight:700;font-size:16px;margin:12px 0 4px;
+  padding-left:11px;border-left:4px solid var(--acc2);}
+
+/* tabs */
+.stTabs [data-baseweb="tab-list"]{gap:6px;border-bottom:1px solid var(--line);flex-wrap:wrap;padding-bottom:2px;}
+.stTabs [data-baseweb="tab"]{padding:8px 15px;border-radius:11px;font-family:'Sora',sans-serif;
+  font-weight:600;font-size:13px;color:var(--muted);transition:all .15s ease;}
+.stTabs [data-baseweb="tab"]:hover{background:var(--card2);color:inherit;}
+.stTabs [aria-selected="true"]{background:var(--acc);color:#fff!important;box-shadow:0 6px 16px rgba(0,0,0,.18);}
+.stTabs [data-baseweb="tab-highlight"]{display:none;}
+.stTabs [data-baseweb="tab-border"]{display:none;}
+
+/* metrics as mini tiles */
+[data-testid="stMetric"]{background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:13px 16px;box-shadow:var(--shadow);}
+[data-testid="stMetricLabel"] p{font-family:'IBM Plex Mono',monospace;font-size:10px!important;
+  letter-spacing:.1em;text-transform:uppercase;color:var(--muted);}
+[data-testid="stMetricValue"]{font-family:'IBM Plex Mono',monospace;font-weight:600;
+  font-variant-numeric:tabular-nums;}
+
+/* dataframe + charts */
+[data-testid="stDataFrame"]{border:1px solid var(--line);border-radius:14px;overflow:hidden;box-shadow:var(--shadow);}
+[data-testid="stPlotlyChart"]{border-radius:14px;}
+
+/* buttons */
+.stButton>button,.stDownloadButton>button{border-radius:11px;font-family:'Sora',sans-serif;
+  font-weight:600;border:1px solid var(--line);transition:all .15s ease;}
+.stButton>button:hover{border-color:var(--acc);color:var(--acc);transform:translateY(-1px);}
+.stDownloadButton>button{background:var(--acc);color:#fff;border:none;}
+.stDownloadButton>button:hover{filter:brightness(1.08);color:#fff;transform:translateY(-1px);}
+
+.note{color:var(--muted);font-size:12px;font-family:'IBM Plex Mono',monospace;line-height:1.55;}
+hr{border-color:var(--line);}
+
 @media (max-width:820px){
   .kpi-row{grid-template-columns:repeat(2,1fr);}
-  .hero{padding:18px 18px;border-radius:16px;} .hero h1{font-size:20px;}
-  .kpi .v{font-size:22px;} .block-container{padding-left:.6rem;padding-right:.6rem;}
+  .hero{padding:18px 18px;border-radius:18px;} .hero h1{font-size:20px;}
+  .kpi .v{font-size:23px;} .block-container{padding-left:.7rem;padding-right:.7rem;}
 }
 @media (max-width:430px){ .kpi-row{grid-template-columns:1fr;} }
+@media (prefers-reduced-motion:reduce){*{transition:none!important;}}
 </style>
 """
 
 
 def style_fig(fig, height=340, accent="#E23744"):
     fig.update_layout(
-        height=height, margin=dict(l=10, r=10, t=46, b=10),
+        height=height, margin=dict(l=12, r=16, t=50, b=12),
         font=dict(family="Inter, sans-serif", size=12, color=INK),
-        title=dict(font=dict(family="Sora, sans-serif", size=15, color=INK)),
+        title=dict(font=dict(family="Sora, sans-serif", size=15.5, color=INK), x=0,
+                   xanchor="left", pad=dict(l=2, b=6)),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        legend=dict(orientation="h", y=1.16, x=1, xanchor="right", font=dict(size=11, color=INK)),
-        colorway=[accent, "#9A9DA3", "#C5821C", "#3A6EA5"])
-    fig.update_xaxes(gridcolor=GRID, zeroline=False, linecolor=AXIS, tickfont=dict(color=INK))
-    fig.update_yaxes(gridcolor=GRID, zeroline=False, linecolor=AXIS, tickfont=dict(color=INK))
+        legend=dict(orientation="h", y=1.16, x=1, xanchor="right",
+                    font=dict(size=11, color=INK), bgcolor="rgba(0,0,0,0)"),
+        hoverlabel=dict(bgcolor="rgba(16,20,26,.94)", bordercolor="rgba(255,255,255,.10)",
+                        font=dict(family="IBM Plex Mono, monospace", size=11.5, color="#fff")),
+        colorway=[accent, "#9A9DA3", "#C5821C", "#3A6EA5", "#7A0010", "#1F9D57"])
+    fig.update_xaxes(gridcolor=GRID, zeroline=False, linecolor=AXIS, tickfont=dict(color=INK),
+                     title_font=dict(color=INK, size=11.5))
+    fig.update_yaxes(gridcolor=GRID, zeroline=False, linecolor=AXIS, tickfont=dict(color=INK),
+                     title_font=dict(color=INK, size=11.5))
     return fig
 
 
@@ -1460,11 +1534,14 @@ def main():
             within = vv["within_standard"]
             n_ok = int((within == True).sum())
             n_bad = int((within == False).sum())
+            n_anom = int(vv["anomaly_days"].sum()) if "anomaly_days" in vv else 0
+            anom_txt = (f" · <b>{n_anom}</b> delivery-sized day(s) (>1,000 L) excluded as unbooked "
+                        f"deliveries" if n_anom else "")
             st.markdown(f"<div class='note'>Total variance = sum of the sheet's {rp} Dv "
                         f"(matches your Sheet2 VAR). Standard: <b>±{std:.0f} L/day</b> "
-                        f"· within: <b>{n_ok}</b> · exceeding: <b>{n_bad}</b>. A large swing "
-                        f"either way is flagged — a big <b>gain</b> usually means a delivery that "
-                        f"bumped the dip wasn't booked.</div>", unsafe_allow_html=True)
+                        f"· within: <b>{n_ok}</b> · exceeding: <b>{n_bad}</b>{anom_txt}. A large "
+                        f"swing either way is flagged — a big <b>gain</b> usually means a delivery "
+                        f"that bumped the dip wasn't booked.</div>", unsafe_allow_html=True)
             c1, c2 = st.columns(2, gap="large")
             with c1:
                 vt = vv.dropna(subset=["dip_variance"]).sort_values("dip_variance")
