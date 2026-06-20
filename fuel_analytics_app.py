@@ -1174,7 +1174,8 @@ def main():
 
     f0 = lambda x: "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:,.0f}"
     tabs = st.tabs(["Overview", "Targets vs Actual", "Price Sensitivity", "Days to Run Out",
-                    "Efficiency", "Variance", "Rankings", "🔮 Forecast", "🚨 Alerts", "Trends"])
+                    "Efficiency", "Variance", "Rankings", "🔮 Forecast", "🚨 Alerts", "Trends",
+                    "💸 Money"])
 
     # ============================ OVERVIEW ============================
     with tabs[0]:
@@ -1825,6 +1826,94 @@ def main():
                                 use_container_width=True)
         else:
             st.info("No data for this selection.")
+
+    # ============================ COST OF LOSSES ($) ============================
+    with tabs[10]:
+        st.markdown("<div class='eyebrow'>What your stock losses cost · current period</div>",
+                    unsafe_allow_html=True)
+        st.subheader("💸 Cost of losses")
+
+        med_price = {rp: (float(df[df["product"] == rp]["price"].dropna().median())
+                          if df[df["product"] == rp]["price"].notna().any() else np.nan)
+                     for rp in real_products}
+
+        def _price(station, rp):
+            s = df[(df["station"] == station) & (df["product"] == rp)].dropna(subset=["price"])
+            return float(s.sort_values("date")["price"].iloc[-1]) if len(s) else med_price.get(rp, np.nan)
+
+        rows = []
+        for rp in real_products:
+            vv = compute_variance(df, rp, pd.DataFrame(), cur_s, cur_e, STANDARD[rp])
+            for _, r in vv.iterrows():
+                nv = r["dip_variance"]
+                days = int(r["days"]) if not np.isnan(r["days"]) else 0
+                loss_l = max(-nv, 0.0) if not np.isnan(nv) else 0.0
+                price = _price(r["station"], rp)
+                money = loss_l * price if not np.isnan(price) else np.nan
+                annual = ((loss_l / days * 365 * price) if (days and not np.isnan(price)) else np.nan)
+                rows.append({"station": r["station"], "product": rp, "loss_l": loss_l,
+                             "price": price, "money": money, "annual": annual})
+        md = pd.DataFrame(rows)
+        tot_loss = md["loss_l"].sum()
+        tot_money = md["money"].sum(skipna=True)
+        tot_annual = md["annual"].sum(skipna=True)
+        cb = compute_banking(banking_frame(df))
+        unbanked = (float(cb["outstanding"].clip(lower=0).sum())
+                    if (not cb.empty and cb["outstanding"].notna().any()) else 0.0)
+
+        kpi_row([
+            ("Litres lost", f0(tot_loss), "L", f"{fmt(cur_s)} → {fmt(cur_e)}", accent),
+            ("Cost this period", f0(tot_money), "GHS", "litres lost × pump price", accent),
+            ("Annualized loss", f0(tot_annual), "GHS/yr", "at the current loss rate", accent),
+            ("Unbanked cash now", f0(unbanked), "GHS", "sales not yet deposited", "#2563EB"),
+        ])
+
+        if tot_loss <= 0:
+            st.success("No net stock losses in this period — nothing is leaking. 🎉")
+        else:
+            worst = md.dropna(subset=["annual"]).sort_values("annual", ascending=False)
+            wline = ""
+            if len(worst) and worst.iloc[0]["annual"] > 0:
+                w = worst.iloc[0]
+                wline = (f" The biggest single leak is <b>{w['station']} {w['product']}</b> at about "
+                         f"<b>GHS {w['annual']:,.0f}/year</b>.")
+            st.markdown(
+                f"<div class='summary'>💸 At the current rate, stock losses are costing roughly "
+                f"<b>GHS {tot_money:,.0f}</b> this period — about <b>GHS {tot_annual:,.0f} a year</b>. "
+                f"Recovering half would save ~<b>GHS {tot_annual/2:,.0f}/year</b>.{wline}"
+                + (f" Separately, <b>GHS {unbanked:,.0f}</b> of cash is still sitting unbanked."
+                   if unbanked > 0 else "") + "</div>", unsafe_allow_html=True)
+
+            piv = md.pivot_table(index="station", values="money", columns="product",
+                                 aggfunc="sum").fillna(0.0)
+            piv["__t"] = piv.sum(axis=1)
+            piv = piv[piv["__t"] > 0].sort_values("__t").drop(columns="__t")
+            if not piv.empty:
+                fig = go.Figure()
+                for rp in real_products:
+                    if rp in piv.columns:
+                        fig.add_bar(y=piv.index, x=piv[rp], orientation="h", name=rp,
+                                    marker_color=PCOL[rp],
+                                    text=[f"{v:,.0f}" if v > 0 else "" for v in piv[rp]],
+                                    textposition="inside", textfont=dict(color="white", size=10))
+                fig.update_layout(barmode="stack",
+                                  title="Cost of stock losses by station (GHS, this period)")
+                fig.update_xaxes(title_text="GHS lost")
+                st.plotly_chart(style_fig(fig, max(300, 36 * len(piv)), accent),
+                                use_container_width=True)
+
+            show = md[md["loss_l"] > 0].copy().sort_values("annual", ascending=False)
+            show = show.rename(columns={
+                "station": "Station", "product": "Product", "loss_l": "Litres lost",
+                "price": "Price (GHS/L)", "money": "Cost this period (GHS)",
+                "annual": "Annualized (GHS/yr)"})
+            st.dataframe(show.style.format({
+                "Litres lost": "{:,.1f}", "Price (GHS/L)": "{:,.2f}",
+                "Cost this period (GHS)": "{:,.0f}", "Annualized (GHS/yr)": "{:,.0f}"}, na_rep="—"),
+                use_container_width=True, hide_index=True)
+        st.caption("Loss = net negative dip variance (gains and excluded delivery days don't count), "
+                   "valued at each station's latest pump price. Annualized = current daily loss "
+                   "rate × 365. Unbanked cash is shown alongside as the other pool of money at risk.")
 
     st.caption("All figures from the MASTER sheet · prices in GHS · target = 2× median "
                "baseline month, measured against the current period.")
