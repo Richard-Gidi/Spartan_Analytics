@@ -853,35 +853,78 @@ def _medal(i):
 
 # ────────────────────────────── WhatsApp text ──────────────────────────────
 def build_whatsapp_text(meta, per_product, top_n=3):
+    """A plain-language brief anyone can read on WhatsApp: a headline, a short key
+    that explains each figure, then a concise section per grade."""
     kP, kA = per_product["PMS"]["kpis"], per_product["AGO"]["kpis"]
-    L = ["*SPARTAN FUEL \u2014 PERFORMANCE REPORT*", f"_{meta['period']} \u00b7 whole network_", ""]
-    L.append("\U0001F4CA *NETWORK TOTAL*")
-    tot_a, tot_t = kP["actual"] + kA["actual"], kP["target"] + kA["target"]
-    ov = "" if tot_t <= 0 else f" \u2014 {tot_a / tot_t * 100:.0f}% of target"
-    L.append(f"Sold *{_f0(tot_a)} L* of {_f0(tot_t)} L{ov}")
-    L.append(f"{DOT['PMS']} PMS {_pct(kP['attainment'])}   {DOT['AGO']} AGO {_pct(kA['attainment'])}")
+    tot_a = kP["actual"] + kA["actual"]
+    tot_t = kP["target"] + kA["target"]
+    std = int(per_product["PMS"]["std"])
+
+    # friendly target phrase (strip the leading "Target = " from the note)
+    tn = meta.get("target_note", "twice the median of the earlier months this year")
+    for pref in ("Target = ", "Target= ", "Target "):
+        if tn.startswith(pref):
+            tn = tn[len(pref):]
+            break
+
+    L = ["*SPARTAN FUEL \u2014 MONTHLY REPORT*",
+         f"_{meta['period']} \u00b7 whole network (PMS + AGO)_", ""]
+
+    # ---- headline ----
+    L.append("\U0001F4CA *THE HEADLINE*")
+    if tot_t > 0:
+        L.append(f"This month we sold *{_f0(tot_a)} L* in total \u2014 that is *{tot_a / tot_t * 100:.0f}%* "
+                 f"of our {_f0(tot_t)} L target.")
+        L.append(f"{DOT['PMS']} Petrol (PMS): {_pct(kP['attainment'])} of target    "
+                 f"{DOT['AGO']} Diesel (AGO): {_pct(kA['attainment'])} of target")
+    else:
+        L.append(f"This month we sold *{_f0(tot_a)} L* in total.")
+        L.append("No target was set for this month \u2014 it is the first month of the year, so there "
+                 "are no earlier months yet to base a target on.")
     L.append("")
+
+    # ---- key: what each number means ----
+    L.append("\u2139\uFE0F *WHAT THE NUMBERS MEAN*")
+    L.append(f"\u2022 *Target* \u2014 {tn}")
+    L.append("\u2022 *% of target* \u2014 how much a station sold compared with its target "
+             "(100% means it hit the goal, above 100% means it beat it).")
+    L.append(f"\u2022 *Stock control (variance)* \u2014 the daily gap between the fuel actually in the "
+             f"tank and what the dip readings say should be there. We allow up to \u00b1{std} litres a "
+             "day per station; smaller is better, and a shortage is fuel we can't account for.")
+    L.append("\u2022 *Sell-through* \u2014 how many days of stock a station has left at its current "
+             "selling pace. Fewer days means it is moving fuel faster.")
+    L.append("")
+
+    # ---- per grade ----
+    names = {"PMS": "PETROL (PMS)", "AGO": "DIESEL (AGO)"}
     for g in ("PMS", "AGO"):
         b = per_product[g]
         k, tgt = b["kpis"], b["tgt"]
-        L.append(f"{DOT[g]} *{GLABEL[g].upper()}*")
-        L.append(f"Sold {_f0(k['actual'])} L / target {_f0(k['target'])} L ({_pct(k['attainment'])})")
-        L.append("Target vs actual (top):")
-        for i, (_, r) in enumerate(tgt.dropna(subset=["attainment_pct"]).head(top_n).iterrows()):
-            L.append(f"   {_medal(i)} {r['station']} \u2014 {r['attainment_pct']:.0f}%")
-        if k["tgt_bot"] and k["tgt_bot"] != k["tgt_top"]:
-            L.append(f"   \u26A0 Lowest: {k['tgt_bot']} \u2014 {_pct(k['tgt_bot_v'])}")
-        if k["flagged"] > 0:
-            L.append(f"\U0001F4C9 Variance: {k['flagged']} outside \u00b1{k['std_lpd']:.0f} L/day "
-                     f"(~{_f0(k['litres_lost'])} L lost); tightest {k['var_top']}")
+        L.append(f"{DOT[g]} *{names[g]}*")
+        if not np.isnan(k["attainment"]):
+            L.append(f"Sold {_f0(k['actual'])} L against a {_f0(k['target'])} L target "
+                     f"\u2014 *{_pct(k['attainment'])}* of target.")
         else:
-            L.append(f"\U0001F4C9 Variance: all within \u00b1{k['std_lpd']:.0f} L/day \u2705")
+            L.append(f"Sold {_f0(k['actual'])} L (no target set this month).")
+        top = tgt.dropna(subset=["attainment_pct"]).head(top_n)
+        if not top.empty:
+            best = ", ".join(f"{r['station']} ({r['attainment_pct']:.0f}%)" for _, r in top.iterrows())
+            L.append(f"\U0001F3C6 Best performers: {best}.")
+        if k["tgt_bot"] and k["tgt_bot"] != k["tgt_top"] and not (
+                isinstance(k["tgt_bot_v"], float) and np.isnan(k["tgt_bot_v"])):
+            L.append(f"\u26A0 Needs attention: {k['tgt_bot']} at {_pct(k['tgt_bot_v'])} of target.")
+        if k["flagged"] > 0:
+            L.append(f"Stock control: {k['flagged']} station(s) went outside the \u00b1{std} L/day "
+                     f"limit \u2014 about {_f0(k['litres_lost'])} L unaccounted for. Tightest control: "
+                     f"{k['var_top']}.")
+        else:
+            L.append(f"Stock control: every station stayed within the \u00b1{std} L/day limit \u2705.")
         if k["eff_top"]:
-            ev = "\u2014" if np.isnan(k["eff_top_v"]) else f"{k['eff_top_v']:.1f} d"
-            L.append(f"\u26A1 Efficiency: fastest {k['eff_top']} ({ev} to stock-out)")
+            ev = "" if np.isnan(k["eff_top_v"]) else f" (about {k['eff_top_v']:.1f} days of stock)"
+            L.append(f"Selling fastest: {k['eff_top']}{ev}.")
         L.append("")
-    L.append(f"_{meta.get('target_note', '')}_")
-    L.append("\U0001F4CE Full ranked breakdown + tables in the attached PDF.")
+
+    L.append("\U0001F4CE The attached PDF has the full ranked charts and every station's figures.")
     L.append(f"_Generated {meta['generated']}_")
     return "\n".join(L)
 
