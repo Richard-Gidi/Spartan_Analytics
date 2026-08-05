@@ -5,3 +5,4 @@ plotly>=5.18
 openpyxl>=3.1
 requests>=2.31
 python-dotenv>=1.0
+matplotlib>=3.8
