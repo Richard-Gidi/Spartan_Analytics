@@ -733,6 +733,303 @@ def build_excel(sheets):
     return bio.getvalue()
 
 
+# ─────────────────── reporting engine (PDF + WhatsApp) ─────────────────────
+COLORS = {"PMS": "#E23744", "AGO": "#1F9D57"}
+GLABEL = {"PMS": "PMS · Petrol", "AGO": "AGO · Diesel"}
+DOT = {"PMS": "🔴", "AGO": "🟢"}
+
+
+# ─────────────────────────── pillar ranking (per grade) ────────────────────
+def build_pillars(targets, variance_df, efficiency_df):
+    tgt = targets[["station", "actual_total", "monthly_target", "attainment_pct",
+                   "gap_litres"]].copy()
+    tgt = tgt.sort_values("attainment_pct", ascending=False,
+                          na_position="last").reset_index(drop=True)
+    tgt.insert(0, "rank", range(1, len(tgt) + 1))
+
+    vr = variance_df[["station", "avg_daily_var", "dip_variance", "within_standard",
+                      "days"]].copy()
+    vr["abs_daily"] = vr["avg_daily_var"].abs()
+    vr = vr.sort_values("abs_daily", ascending=True,
+                        na_position="last").reset_index(drop=True)
+    vr.insert(0, "rank", range(1, len(vr) + 1))
+
+    er = efficiency_df[["station", "days_to_stockout", "turnover_per_day",
+                        "avg_daily_sales"]].copy()
+    er = er.sort_values("days_to_stockout", ascending=True,
+                        na_position="last").reset_index(drop=True)
+    er.insert(0, "rank", range(1, len(er) + 1))
+    return tgt, vr, er
+
+
+def _verdict(att):
+    if att is None or np.isnan(att):
+        return "no target basis"
+    return "ahead of plan" if att >= 100 else ("on track" if att >= 75 else "behind plan")
+
+
+def report_kpis(tgt_rank, var_rank, eff_rank, std_lpd):
+    tot_a = float(np.nansum(tgt_rank["actual_total"].values)) if len(tgt_rank) else 0.0
+    tot_t = float(np.nansum(tgt_rank["monthly_target"].values)) if len(tgt_rank) else 0.0
+    att = (tot_a / tot_t * 100) if tot_t > 0 else np.nan
+    net_var = float(np.nansum(var_rank["dip_variance"].values)) if len(var_rank) else 0.0
+    lost = float(-var_rank["dip_variance"].clip(upper=0).sum()) if len(var_rank) else 0.0
+    flagged = int((var_rank["within_standard"] == False).sum()) if len(var_rank) else 0  # noqa:E712
+
+    def _lead(frame, col, ascending):
+        f = frame.dropna(subset=[col])
+        if f.empty:
+            return None, np.nan
+        r = f.sort_values(col, ascending=ascending).iloc[0]
+        return r["station"], float(r[col])
+
+    tgt_top, tgt_top_v = _lead(tgt_rank, "attainment_pct", False)
+    tgt_bot, tgt_bot_v = _lead(tgt_rank, "attainment_pct", True)
+    eff_top, eff_top_v = _lead(eff_rank, "days_to_stockout", True)
+    if var_rank["avg_daily_var"].notna().any():
+        vr0 = var_rank.dropna(subset=["avg_daily_var"]).iloc[0]
+        var_top, var_top_v = vr0["station"], float(vr0["avg_daily_var"])
+    else:
+        var_top, var_top_v = None, np.nan
+
+    return {"actual": tot_a, "target": tot_t, "attainment": att, "verdict": _verdict(att),
+            "net_var": net_var, "litres_lost": lost, "flagged": flagged, "std_lpd": std_lpd,
+            "tgt_top": tgt_top, "tgt_top_v": tgt_top_v, "tgt_bot": tgt_bot, "tgt_bot_v": tgt_bot_v,
+            "eff_top": eff_top, "eff_top_v": eff_top_v, "var_top": var_top, "var_top_v": var_top_v,
+            "stations": int(len(tgt_rank))}
+
+
+def _f0(x):
+    return "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:,.0f}"
+
+
+def _medal(i):
+    return {0: "🥇", 1: "🥈", 2: "🥉"}.get(i, f"{i + 1}.")
+
+
+# ────────────────────────────── WhatsApp text ──────────────────────────────
+def build_whatsapp_text(meta, per_product, top_n=3):
+    L = ["*SPARTAN FUEL — PERFORMANCE REPORT*", f"_{meta['period']} · both grades_", ""]
+    L.append("📊 *NETWORK*")
+    for g in ("PMS", "AGO"):
+        k = per_product[g]["kpis"]
+        att = "" if np.isnan(k["attainment"]) else f" — {k['attainment']:.0f}%"
+        L.append(f"{DOT[g]} {g}: {_f0(k['actual'])} L / {_f0(k['target'])} L{att}")
+    L.append("")
+
+    for g in ("PMS", "AGO"):
+        b = per_product[g]
+        k, tgt, var, eff = b["kpis"], b["tgt"], b["var"], b["eff"]
+        L.append(f"{DOT[g]} *{GLABEL[g].upper()}*")
+        L.append("🎯 Target vs actual:")
+        for i, (_, r) in enumerate(tgt.dropna(subset=["attainment_pct"]).head(top_n).iterrows()):
+            L.append(f"   {_medal(i)} {r['station']} — {r['attainment_pct']:.0f}%")
+        if k["tgt_bot"] and k["tgt_bot"] != k["tgt_top"]:
+            L.append(f"   ⚠ Lowest: {k['tgt_bot']} — {k['tgt_bot_v']:.0f}%")
+        if k["flagged"] > 0:
+            L.append(f"📉 Variance: {k['flagged']} outside ±{k['std_lpd']:.0f} L/day "
+                     f"(~{_f0(k['litres_lost'])} L lost); tightest {k['var_top']}")
+        else:
+            L.append(f"📉 Variance: all within ±{k['std_lpd']:.0f} L/day")
+        if k["eff_top"]:
+            ev = "—" if np.isnan(k["eff_top_v"]) else f"{k['eff_top_v']:.1f} d"
+            L.append(f"⚡ Efficiency: fastest {k['eff_top']} ({ev} to stock-out)")
+        L.append("")
+
+    L.append("📎 Full ranked breakdown in the attached PDF.")
+    L.append(f"_Generated {meta['generated']}_")
+    return "\n".join(L)
+
+
+# ───────────────────────────────── PDF ─────────────────────────────────────
+def build_report_pdf(meta, per_product):
+    import textwrap as _tw
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle, FancyBboxPatch, Circle
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    INK, SUB, LINE, DARK = "#1d2330", "#6b7280", "#e3e6ea", "#0C1014"
+    A4 = (8.27, 11.69)
+    plt.rcParams.update({"font.family": "DejaVu Sans", "axes.edgecolor": LINE,
+                         "text.color": INK, "axes.labelcolor": INK})
+
+    def new_page():
+        fig = plt.figure(figsize=A4, dpi=150)
+        bg = fig.add_axes([0, 0, 1, 1]); bg.set_xlim(0, 1); bg.set_ylim(0, 1); bg.axis("off")
+        return fig, bg
+
+    def band(bg, title, sub):
+        bg.add_patch(Rectangle((0, 0.9), 1, 0.1, color=DARK, zorder=1))
+        bg.add_patch(Rectangle((0, 0.897), 1, 0.006, color=COLORS["PMS"], zorder=2))
+        bg.text(0.06, 0.958, title, color="white", fontsize=15, fontweight="bold",
+                va="center", zorder=3)
+        bg.text(0.06, 0.923, sub, color="#aab2bc", fontsize=8.2, va="center", zorder=3,
+                family="monospace")
+        bg.text(0.94, 0.945, "SPARTAN", color="#6b7480", fontsize=8, va="center",
+                ha="right", zorder=3, family="monospace", fontweight="bold")
+
+    def footer(bg, page_txt):
+        bg.add_patch(Rectangle((0, 0), 1, 0.032, color="#f4f5f7", zorder=1))
+        bg.text(0.06, 0.016, meta["footer"], color=SUB, fontsize=6.6, va="center", zorder=2)
+        bg.text(0.94, 0.016, page_txt, color=SUB, fontsize=6.6, va="center", ha="right", zorder=2)
+
+    def legend(bg, y):
+        bg.add_patch(Circle((0.065, y), 0.006, color=COLORS["PMS"], zorder=3,
+                            transform=bg.transData))
+        bg.text(0.08, y, "PMS · Petrol", fontsize=8, color=INK, va="center", zorder=3)
+        bg.add_patch(Circle((0.235, y), 0.006, color=COLORS["AGO"], zorder=3,
+                            transform=bg.transData))
+        bg.text(0.25, y, "AGO · Diesel", fontsize=8, color=INK, va="center", zorder=3)
+
+    def panel(fig, bg, rect, subtitle, d, valcol, color, mode, std=10.0):
+        # subtitle above the axes
+        bg.text(rect[0] - 0.26, rect[1] + rect[3] + 0.012, subtitle, fontsize=9.4,
+                color=INK, fontweight="bold", va="center", zorder=3)
+        ax = fig.add_axes(rect)
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+        ax.spines["left"].set_color(LINE); ax.spines["bottom"].set_color(LINE)
+        ax.tick_params(colors=SUB, labelsize=7.5, length=0)
+        ax.grid(axis="x", color="#eef0f2", zorder=0); ax.set_axisbelow(True)
+        dd = d.dropna(subset=[valcol])
+        n = len(dd)
+        if n == 0:
+            ax.text(0.5, 0.5, "No data for this grade / month.", ha="center", va="center",
+                    transform=ax.transAxes, color=SUB, fontsize=8)
+            ax.set_xticks([]); ax.set_yticks([])
+            return
+        vals = dd[valcol].values[::-1]
+        stns = list(dd["station"])
+        labels = [f"{i + 1}. {s}" for i, s in enumerate(stns)][::-1]
+        ax.barh(range(n), vals, color=color, height=0.62, zorder=3)
+        ax.set_yticks(range(n)); ax.set_yticklabels(labels)
+
+        if mode == "target":
+            ax.axvline(100, color=INK, lw=1.0, ls="--", zorder=4)
+            top = max(vals.max(), 100)
+            for i, v in enumerate(vals):
+                ax.text(v + top * 0.012, i, f"{v:.0f}%", va="center", fontsize=7.2,
+                        color=INK, fontweight="bold")
+            ax.set_xlim(0, top * 1.17)
+            ax.set_xlabel("Attainment %  (dashed = 100% target)", fontsize=7.8)
+        elif mode == "variance":
+            ax.axvline(0, color=INK, lw=1.0, zorder=4)
+            for s in (std, -std):
+                ax.axvline(s, color=SUB, lw=1.0, ls="--", zorder=4)
+            span = max(abs(vals.min()), abs(vals.max()), std) * 1.30
+            for i, v in enumerate(vals):
+                ax.text(v + (span * 0.02 if v >= 0 else -span * 0.02), i, f"{v:+.1f}",
+                        va="center", ha="left" if v >= 0 else "right", fontsize=7.0,
+                        color=INK, fontweight="bold")
+            ax.set_xlim(-span, span)
+            ax.set_xlabel(f"Avg dip variance L/day  (dashed = ±{std:.0f})", fontsize=7.8)
+        else:  # efficiency
+            top = max(vals.max(), 1)
+            for i, v in enumerate(vals):
+                ax.text(v + top * 0.012, i, f"{v:.1f} d", va="center", fontsize=7.2,
+                        color=INK, fontweight="bold")
+            ax.set_xlim(0, top * 1.17)
+            ax.set_xlabel("Days to stock out  (shorter = faster)", fontsize=7.8)
+
+    pages = PdfPages(meta["_buffer"])
+
+    # ---------------- PAGE 1 — cover ----------------
+    fig, bg = new_page()
+    band(bg, "SPARTAN FUEL — PERFORMANCE REPORT", meta["cover_sub"])
+
+    kp, ka = per_product["PMS"]["kpis"], per_product["AGO"]["kpis"]
+    tot_a = kp["actual"] + ka["actual"]
+    tot_t = kp["target"] + ka["target"]
+    att = (tot_a / tot_t * 100) if tot_t > 0 else np.nan
+    net_v = kp["net_var"] + ka["net_var"]
+    flg = kp["flagged"] + ka["flagged"]
+    cards = [
+        ("TOTAL REALIZED", f"{_f0(tot_a)} L", f"of {_f0(tot_t)} L target"),
+        ("ATTAINMENT", "—" if np.isnan(att) else f"{att:.0f}%", _verdict(att)),
+        ("NET VARIANCE", f"{net_v:+,.0f} L", f"{flg} station-grade(s) flagged"),
+        ("STATIONS", f"{max(kp['stations'], ka['stations'])}", "PMS + AGO both shown"),
+    ]
+    x0, w, gap, y, h = 0.06, 0.205, 0.0133, 0.775, 0.09
+    for i, (lab, val, sub) in enumerate(cards):
+        x = x0 + i * (w + gap)
+        bg.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.004,rounding_size=0.010",
+                     linewidth=1, edgecolor=LINE, facecolor="#fbfbfc", zorder=2))
+        bg.add_patch(Rectangle((x, y), w, 0.004, color=COLORS["PMS"], zorder=3))
+        bg.text(x + 0.014, y + h - 0.020, lab, fontsize=6.1, color=SUB, family="monospace",
+                va="center", zorder=3)
+        s = str(val)
+        fs = 15 if len(s) <= 9 else (11.5 if len(s) <= 12 else 9.5)
+        bg.text(x + 0.014, y + 0.046, s, fontsize=fs, color=INK, fontweight="bold",
+                va="center", zorder=3)
+        bg.text(x + 0.014, y + 0.016, sub, fontsize=6.0, color=SUB, va="center", zorder=3)
+
+    legend(bg, 0.742)
+    bg.text(0.06, 0.712, "EXECUTIVE SUMMARY", fontsize=8, color=COLORS["PMS"],
+            family="monospace", fontweight="bold")
+    bg.add_patch(Rectangle((0.06, 0.706), 0.03, 0.003, color=COLORS["PMS"]))
+    bg.text(0.06, 0.655, _tw.fill(meta["summary"], width=104), fontsize=9.0, color=INK,
+            va="top", linespacing=1.55)
+
+    # per-grade callouts
+    bg.text(0.06, 0.5, "BY GRADE", fontsize=8, color=COLORS["PMS"], family="monospace",
+            fontweight="bold")
+    bg.add_patch(Rectangle((0.06, 0.494), 0.03, 0.003, color=COLORS["PMS"]))
+    yy = 0.462
+    for g in ("PMS", "AGO"):
+        k = per_product[g]["kpis"]; c = COLORS[g]
+        bg.add_patch(FancyBboxPatch((0.06, yy - 0.088), 0.88, 0.096,
+                     boxstyle="round,pad=0.004,rounding_size=0.008",
+                     linewidth=1, edgecolor=LINE, facecolor="#fbfbfc", zorder=2))
+        bg.add_patch(Rectangle((0.06, yy - 0.088), 0.006, 0.096, color=c, zorder=3))
+        bg.add_patch(Circle((0.09, yy - 0.006), 0.006, color=c, zorder=4))
+        bg.text(0.108, yy - 0.006, GLABEL[g], fontsize=10, color=INK, fontweight="bold",
+                va="center", zorder=3)
+        at = "—" if np.isnan(k["attainment"]) else f"{k['attainment']:.0f}%"
+        bg.text(0.5, yy - 0.006, f"{_f0(k['actual'])} L / {_f0(k['target'])} L  ·  {at}",
+                fontsize=8.5, color=SUB, va="center", zorder=3)
+        line2 = (f"Best: {k['tgt_top']} ({0 if np.isnan(k['tgt_top_v']) else k['tgt_top_v']:.0f}%)"
+                 f"   ·   Weakest: {k['tgt_bot']} "
+                 f"({0 if np.isnan(k['tgt_bot_v']) else k['tgt_bot_v']:.0f}%)")
+        line3 = (f"Variance: {k['flagged']} outside \u00b1{k['std_lpd']:.0f} L/day"
+                 f"   ·   Fastest sell-through: {k['eff_top']}"
+                 + ("" if np.isnan(k['eff_top_v']) else f" ({k['eff_top_v']:.1f} d)"))
+        bg.text(0.108, yy - 0.04, line2, fontsize=8.0, color=SUB, va="center", zorder=3)
+        bg.text(0.108, yy - 0.066, line3, fontsize=8.0, color=SUB, va="center", zorder=3)
+        yy -= 0.115
+
+    footer(bg, "Page 1 · Summary")
+    pages.savefig(fig); plt.close(fig)
+
+    # ---------------- PAGES 2-4 — one per pillar, PMS + AGO panels ----------------
+    pillars = [
+        ("1 · TARGET vs ACTUAL REALIZED",
+         "Stations ranked by target attainment (%), per grade. Longer bars = higher attainment.",
+         "attainment_pct", "target", "tgt", "Page 2 · Target vs Actual"),
+        ("2 · STOCK VARIANCE",
+         "Stations ranked by tightest stock control (avg dip variance L/day). "
+         "Dashed lines mark the ± standard.",
+         "avg_daily_var", "variance", "var", "Page 3 · Variance"),
+        ("3 · EFFICIENCY",
+         "Stations ranked by fastest sell-through (avg days to stock out). Shorter = faster.",
+         "days_to_stockout", "efficiency", "eff", "Page 4 · Efficiency"),
+    ]
+    for title, blurb, valcol, mode, key, pagetxt in pillars:
+        fig, bg = new_page()
+        band(bg, title, meta["cover_sub"])
+        bg.text(0.06, 0.865, blurb, fontsize=8.2, color=SUB, va="center")
+        legend(bg, 0.835)
+        panel(fig, bg, [0.31, 0.475, 0.62, 0.30], GLABEL["PMS"],
+              per_product["PMS"][key], valcol, COLORS["PMS"], mode, per_product["PMS"]["std"])
+        panel(fig, bg, [0.31, 0.085, 0.62, 0.30], GLABEL["AGO"],
+              per_product["AGO"][key], valcol, COLORS["AGO"], mode, per_product["AGO"]["std"])
+        footer(bg, pagetxt)
+        pages.savefig(fig); plt.close(fig)
+
+    pages.close()
+    return meta["_buffer"].getvalue()
+
 # ─────────────────────────────────── theme ─────────────────────────────────
 CSS = """
 <style>
@@ -1175,7 +1472,7 @@ def main():
     f0 = lambda x: "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:,.0f}"
     tabs = st.tabs(["Overview", "Targets vs Actual", "Price Sensitivity", "Days to Run Out",
                     "Efficiency", "Variance", "Rankings", "🔮 Forecast", "🚨 Alerts", "Trends",
-                    "💸 Money"])
+                    "💸 Money", "📄 Report"])
 
     # ============================ OVERVIEW ============================
     with tabs[0]:
@@ -1914,6 +2211,146 @@ def main():
         st.caption("Loss = net negative dip variance (gains and excluded delivery days don't count), "
                    "valued at each station's latest pump price. Annualized = current daily loss "
                    "rate × 365. Unbanked cash is shown alongside as the other pool of money at risk.")
+
+    # ============================ REPORT ============================
+    with tabs[11]:
+        st.markdown("<div class='eyebrow'>Stakeholder report · PMS &amp; AGO · monthly</div>",
+                    unsafe_allow_html=True)
+        st.subheader("📄 Monthly performance report")
+        st.caption("Ranks every station on the three pillars — Target vs Actual realized, "
+                   "Variance, and Efficiency — for PMS (red) and AGO (green) separately, in one "
+                   "file. Pick a month below; the report covers the whole network for that month, "
+                   "regardless of the grade/station chosen in the sidebar.")
+
+        # ---- month picker ----
+        rmonths = pd.period_range(dmin.to_period("M"), dmax.to_period("M"), freq="M")
+        rlabels = [p.strftime("%B %Y") for p in rmonths]
+        rpick = st.selectbox("Report month", rlabels, index=len(rlabels) - 1, key="rep_month")
+        rsel = rmonths[rlabels.index(rpick)]
+        rep_cs = max(pd.Timestamp(rsel.start_time.date()), dmin)
+        rep_ce = min(pd.Timestamp(rsel.end_time.date()), dmax)
+        rb_end = pd.Timestamp(rsel.start_time.date()) - pd.Timedelta(days=1)
+        if dmin <= rb_end:
+            rep_bs, rep_be = dmin, rb_end
+        else:                                   # first month in the data
+            rep_bs, rep_be = base_s, base_e
+        st.caption(f"Reporting on **{rpick}** ({fmt(rep_cs)} → {fmt(rep_ce)}). "
+                   f"Target basis = 2× median of baseline months {fmt(rep_bs)} → {fmt(rep_be)}.")
+
+        # ---- compute both grades for the chosen month ----
+        rmonth_df = df_all[(df_all["date"] >= rep_cs) & (df_all["date"] <= rep_ce)]
+        per_product = {}
+        for g in ("PMS", "AGO"):
+            tg = compute_targets(df_all, g, rep_bs, rep_be, rep_cs, rep_ce)
+            vr = compute_variance(df_all, g, pd.DataFrame(), rep_cs, rep_ce, STANDARD[g])
+            ef = compute_efficiency(rmonth_df, g)
+            tgt_r, var_r, eff_r = build_pillars(tg, vr, ef)
+            per_product[g] = {"kpis": report_kpis(tgt_r, var_r, eff_r, STANDARD[g]),
+                              "tgt": tgt_r, "var": var_r, "eff": eff_r, "std": STANDARD[g]}
+        kP, kA = per_product["PMS"]["kpis"], per_product["AGO"]["kpis"]
+
+        # ---- headline row (PMS red / AGO green) ----
+        kpi_row([
+            ("PMS realized", f0(kP["actual"]), "L",
+             ("—" if np.isnan(kP["attainment"]) else f"{kP['attainment']:.0f}% · {kP['verdict']}"),
+             PCOL["PMS"]),
+            ("AGO realized", f0(kA["actual"]), "L",
+             ("—" if np.isnan(kA["attainment"]) else f"{kA['attainment']:.0f}% · {kA['verdict']}"),
+             PCOL["AGO"]),
+            ("Total target", f0(kP["target"] + kA["target"]), "L", "PMS + AGO", INK),
+            ("Flagged", f"{kP['flagged'] + kA['flagged']}", "",
+             "outside ±10 L/day", INK),
+        ])
+
+        # ---- accurate summary text (drives the PDF cover) ----
+        _p = lambda k: ("—" if np.isnan(k["attainment"]) else f"{k['attainment']:.0f}%")
+        bits = [f"For {rpick}, PMS realized {f0(kP['actual'])} L of {f0(kP['target'])} L "
+                f"({_p(kP)}, {kP['verdict']}); AGO realized {f0(kA['actual'])} L of "
+                f"{f0(kA['target'])} L ({_p(kA)})."]
+        if kP["tgt_top"]:
+            bits.append(f"PMS best: {kP['tgt_top']} "
+                        f"({0 if np.isnan(kP['tgt_top_v']) else kP['tgt_top_v']:.0f}%); "
+                        f"AGO best: {kA['tgt_top']} "
+                        f"({0 if np.isnan(kA['tgt_top_v']) else kA['tgt_top_v']:.0f}%).")
+        bits.append(f"Variance breaches — PMS {kP['flagged']}, AGO {kA['flagged']} "
+                    f"(±10 L/day standard). Fastest sell-through: PMS {kP['eff_top']}"
+                    + ("" if np.isnan(kP['eff_top_v']) else f" ({kP['eff_top_v']:.1f} d)")
+                    + f", AGO {kA['eff_top']}"
+                    + ("" if np.isnan(kA['eff_top_v']) else f" ({kA['eff_top_v']:.1f} d)") + ".")
+        summary = " ".join(bits)
+        st.markdown(f"<div class='summary'>📋 {summary}</div>", unsafe_allow_html=True)
+
+        # ---- on-screen ranking previews: PMS (red) then AGO (green) per pillar ----
+        def rep_chart(g, key, valcol, mode):
+            color = PCOL[g]
+            d = per_product[g][key].dropna(subset=[valcol]).iloc[::-1]
+            if d.empty:
+                st.info(f"No {g} data for {rpick}.")
+                return
+            if mode == "target":
+                txt = [f"{v:.0f}%" for v in d[valcol]]
+            elif mode == "variance":
+                txt = [f"{v:+.1f}" for v in d[valcol]]
+            else:
+                txt = [f"{v:.1f} d" for v in d[valcol]]
+            fig = go.Figure(go.Bar(x=d[valcol], y=d["station"], orientation="h",
+                                   marker_color=color, text=txt, textposition="outside",
+                                   textfont=dict(color=INK, size=11), cliponaxis=False))
+            if mode == "target":
+                fig.add_vline(x=100, line_dash="dash", line_color=INK, annotation_text="target")
+            elif mode == "variance":
+                fig.add_vline(x=0, line_color=INK)
+                fig.add_vline(x=STANDARD[g], line_dash="dash", line_color=INK,
+                              annotation_text=f"+{STANDARD[g]:.0f}")
+                fig.add_vline(x=-STANDARD[g], line_dash="dash", line_color=INK,
+                              annotation_text=f"-{STANDARD[g]:.0f}")
+            fig.update_layout(title=f"{PLABEL[g]} — ranked")
+            st.plotly_chart(style_fig(fig, max(230, 30 * len(d)), color),
+                            use_container_width=True)
+
+        st.markdown("<div class='eyebrow'>1 · Target vs Actual realized</div>",
+                    unsafe_allow_html=True)
+        rep_chart("PMS", "tgt", "attainment_pct", "target")
+        rep_chart("AGO", "tgt", "attainment_pct", "target")
+
+        st.markdown("<div class='eyebrow'>2 · Variance · stock control</div>",
+                    unsafe_allow_html=True)
+        rep_chart("PMS", "var", "avg_daily_var", "variance")
+        rep_chart("AGO", "var", "avg_daily_var", "variance")
+
+        st.markdown("<div class='eyebrow'>3 · Efficiency · sell-through</div>",
+                    unsafe_allow_html=True)
+        rep_chart("PMS", "eff", "days_to_stockout", "efficiency")
+        rep_chart("AGO", "eff", "days_to_stockout", "efficiency")
+
+        # ---- downloads: PDF (both grades) + WhatsApp ----
+        pstr = rsel.strftime("%Y_%m")
+        meta = {
+            "period": rpick,
+            "generated": datetime.now().strftime("%d %b %Y, %H:%M"),
+            "cover_sub": f"{len(stations)} stations · {rpick} · both grades",
+            "footer": f"Spartan Fuel Analytics · sheet {used_sheet} · GHS · confidential",
+            "summary": summary,
+            "_buffer": io.BytesIO(),
+        }
+        wa_text = build_whatsapp_text(meta, per_product)
+
+        st.markdown("<div class='eyebrow'>PDF report · PMS &amp; AGO</div>", unsafe_allow_html=True)
+        try:
+            pdf_bytes = build_report_pdf(meta, per_product)
+            st.download_button("⬇ Download PDF report", pdf_bytes,
+                               f"spartan_report_{pstr}.pdf", "application/pdf")
+        except Exception as e:
+            st.caption(f"PDF export unavailable ({e}). Install matplotlib: `pip install matplotlib`.")
+
+        st.markdown("<div class='eyebrow'>WhatsApp brief · copy &amp; send with the PDF</div>",
+                    unsafe_allow_html=True)
+        st.caption("Tap the copy icon (top-right of the box), paste into WhatsApp, then attach "
+                   "the PDF above. The *asterisks* become bold in WhatsApp.")
+        st.code(wa_text, language=None)
+        st.download_button("⬇ Download WhatsApp text (.txt)", wa_text,
+                           f"spartan_whatsapp_{pstr}.txt", "text/plain")
+
 
     st.caption("All figures from the MASTER sheet · prices in GHS · target = 2× median "
                "baseline month, measured against the current period.")
