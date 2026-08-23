@@ -1,22 +1,48 @@
 """
-Spartan Fuel — Petroleum Marketing Analytics
-=============================================
-Reads the MASTER sheet of a Google Sheet (link in a .env variable GOOGLE) and
-builds a marketing-analytics workbench for a fuel-retail network.
+Spartan OMC — Downstream Petroleum Analytics
+============================================
+An operating system for a Ghanaian Oil Marketing Company, built on the daily
+station returns already kept in the MASTER tab of a Google Sheet.
+
+Modules
+-------
+  Stocks & Sales   throughput, targets, price sensitivity, runway, efficiency,
+                   dip variance, rankings, forecast, alerts, trends, cost of
+                   losses, and the monthly stakeholder PDF
+  Margins          revenue at pump price less ex-depot cost, dealer margin,
+                   per-litre opex and the cost of missing litres; break-even
+                   volume and working capital tied up in wet stock
+  Pricing          NPA pricing windows (1-15, 16-EOM), price-floor compliance,
+                   network price spread, price/volume response, and the gain or
+                   loss on stock held when the depot price moves
+  Supply           ullage, reorder points, a compartment-level load plan, and
+                   transit shortage between depot and tank
+  Control          wetstock control charts against a throughput tolerance,
+                   daily-return discipline, integrity flags, statutory volume
+                   returns
+  Site card        one site, one page, for a dealer review
+  Banking          cash generated vs deposited (unchanged)
+  Settings         the commercial model - ex-depot cost, dealer margin, opex,
+                   UPPF, price floors, tank capacities, haulage
+
 PMS = petrol (red), AGO = diesel (green), Both = combined throughput.
-Light & dark theme, phone-friendly.
+Light and dark theme, phone-friendly.
 
 Setup
 -----
   .env  ->  GOOGLE=https://docs.google.com/spreadsheets/d/<id>/edit?usp=sharing
-            (Share -> Anyone with the link – Viewer)
+            (Share -> Anyone with the link - Viewer)
+            OMC_CONFIG=omc_config.json          (optional, this is the default)
   pip install -r requirements.txt
   streamlit run fuel_analytics_app.py
 
-Target  = 2 × median of the baseline MONTHLY totals, measured against the actual
+Every money figure depends on the commercial model in Settings. Nothing is
+assumed: until the ex-depot cost table is filled in, margin columns stay blank
+rather than showing a number that was invented.
+
+Target  = 2 x median of the baseline MONTHLY totals, measured against the actual
           total sold in the current period (gauge = % of target obtained).
-Only the MASTER tab is used. The target has its own date window. The values
-below are fixed in code, not shown in the UI.
+Only the MASTER tab is used.
 """
 
 import io
@@ -1196,6 +1222,613 @@ def build_report_pdf(meta, per_product):
     pages.close()
     return meta["_buffer"].getvalue()
 
+# ═══════════════════════════════════════════════════════════════════════════
+#                        OMC LAYER — configuration store
+# ═══════════════════════════════════════════════════════════════════════════
+# Everything commercial (what we pay the BDC, what we pay the dealer, NPA price
+# floors, tank capacities, haulage) lives in one JSON file so the numbers can be
+# updated every pricing window without touching code.
+import json
+import copy
+
+CONFIG_PATH = os.getenv("OMC_CONFIG", "omc_config.json")
+TOLERANCE_PCT = 0.5          # wetstock control limit, % of cumulative throughput
+WINDOW_DAY = 15              # Ghana pricing windows: 1–15 and 16–month end
+
+DEFAULT_CONFIG = {
+    "company": {
+        "name": "Spartan Fuel",
+        "npa_licence": "",
+        "currency": "GHS",
+        "supplier_bdc": "",
+    },
+    # Per-litre commercial model. exdepot is a dated table because it moves every
+    # window; the margins are the fixed pesewas-per-litre legs of the build-up.
+    "economics": {
+        "PMS": {
+            "exdepot": {},            # "YYYY-MM-DD" -> GHS/L invoiced by the BDC
+            "dealer_margin": 0.0,     # GHS/L paid out to the dealer / operator
+            "opex_per_litre": 0.0,    # GHS/L haulage, marking, site overhead, shrink allowance
+            "uppf_recovery": 0.0,     # GHS/L recovered on approved routes, 0 if not claimed
+        },
+        "AGO": {
+            "exdepot": {},
+            "dealer_margin": 0.0,
+            "opex_per_litre": 0.0,
+            "uppf_recovery": 0.0,
+        },
+    },
+    # NPA minimum pump price by window-start date.
+    "floors": {"PMS": {}, "AGO": {}},
+    # Per-site register.
+    "stations": {},
+    "logistics": {
+        "brv_sizes": [45000, 34000, 25000, 16000],
+        "min_drop": 9000,
+        "ullage_reserve_pct": 5.0,     # never plan to fill the last 5% of a tank
+    },
+    "control": {"tolerance_pct": TOLERANCE_PCT},
+    # Optional: national monthly consumption for market-share, "YYYY-MM" -> litres.
+    "market": {"national_monthly_litres": {}},
+}
+
+STATION_DEFAULTS = {
+    "PMS_capacity": 0.0,
+    "AGO_capacity": 0.0,
+    "opex_month": 0.0,          # GHS fixed monthly site cost, for break-even
+    "lead_time_days": 2.0,      # order to discharge
+    "safety_days": 1.5,
+    "region": "",
+    "dealer": "",
+}
+
+
+def _deep_merge(base, over):
+    out = copy.deepcopy(base)
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config(path=CONFIG_PATH):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return _deep_merge(DEFAULT_CONFIG, json.load(fh))
+    except Exception:
+        return copy.deepcopy(DEFAULT_CONFIG)
+
+
+def save_config(cfg, path=CONFIG_PATH):
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=2, sort_keys=True)
+    return path
+
+
+def station_cfg(cfg, station):
+    return _deep_merge(STATION_DEFAULTS, (cfg.get("stations") or {}).get(station, {}))
+
+
+def dated_rate(table, d, default=np.nan):
+    """Step lookup: the value in force on date `d` is the latest entry on or
+    before it. Returns `default` when nothing has been entered yet."""
+    if not table:
+        return default
+    d = pd.Timestamp(d)
+    best_k, best_v = None, default
+    for k, v in table.items():
+        try:
+            kd = pd.Timestamp(k)
+        except Exception:
+            continue
+        if kd <= d and (best_k is None or kd > best_k):
+            best_k, best_v = kd, v
+    try:
+        return float(best_v)
+    except (TypeError, ValueError):
+        return default
+
+
+def rate_table_frame(table):
+    rows = []
+    for k, v in sorted((table or {}).items()):
+        try:
+            rows.append({"effective_from": pd.Timestamp(k), "value": float(v)})
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+
+# ─────────────────────────── Ghana pricing windows ─────────────────────────
+def window_bounds(d):
+    """The NPA pricing window containing `d`: 1–15, or 16–month end."""
+    d = pd.Timestamp(d)
+    if d.day <= WINDOW_DAY:
+        s = d.replace(day=1)
+        e = d.replace(day=WINDOW_DAY)
+    else:
+        s = d.replace(day=WINDOW_DAY + 1)
+        e = d + pd.offsets.MonthEnd(0)
+    return pd.Timestamp(s.date()), pd.Timestamp(e.date())
+
+
+def window_label(d):
+    s, e = window_bounds(d)
+    return f"{s:%d}–{e:%d %b %Y}"
+
+
+def add_windows(frame):
+    f = frame.copy()
+    if f.empty:
+        f["window_start"] = pd.NaT
+        f["window"] = ""
+        return f
+    f["window_start"] = f["date"].map(lambda d: window_bounds(d)[0])
+    f["window"] = f["date"].map(window_label)
+    return f
+
+
+def window_index(dmin, dmax):
+    """All window starts spanned by the data, oldest first."""
+    outs, cur = [], window_bounds(dmin)[0]
+    while cur <= pd.Timestamp(dmax):
+        outs.append(cur)
+        cur = window_bounds(window_bounds(cur)[1] + pd.Timedelta(days=1))[0]
+    return outs
+
+
+# ───────────────────────────── margin engine ───────────────────────────────
+def margin_legs(cfg, product):
+    ec = (cfg.get("economics") or {}).get(product, {}) or {}
+    f = lambda k: float(ec.get(k) or 0.0)
+    return f("dealer_margin"), f("opex_per_litre"), f("uppf_recovery"), (ec.get("exdepot") or {})
+
+
+def priced_frame(df, product, cfg, start, end):
+    """Daily rows for one grade with pump price carried forward, ex-depot cost
+    attached from the dated table, and every per-litre leg applied."""
+    s = _slice(df, product, start, end).dropna(subset=["volume"]).copy()
+    if s.empty:
+        return s
+    dealer, opexl, uppf, exd_tbl = margin_legs(cfg, product)
+    s = s.sort_values(["station", "date"])
+    s["price"] = s.groupby("station")["price"].ffill().bfill()
+    s["exdepot"] = s["date"].map(lambda d: dated_rate(exd_tbl, d))
+    s["revenue"] = s["volume"] * s["price"]
+    s["cogs"] = s["volume"] * s["exdepot"]
+    s["gross"] = s["revenue"] - s["cogs"]
+    s["dealer_cost"] = s["volume"] * dealer
+    s["site_opex"] = s["volume"] * opexl
+    s["uppf_income"] = s["volume"] * uppf
+    s["net"] = s["gross"] - s["dealer_cost"] - s["site_opex"] + s["uppf_income"]
+    return s
+
+
+def compute_margins(df, product, cfg, start, end, cap=DELIVERY_CAP):
+    """Per-station commercial P&L for one grade, with the cost of stock losses
+    charged at ex-depot (the price we actually paid for the litres that vanished)."""
+    s = priced_frame(df, product, cfg, start, end)
+    if s.empty:
+        return pd.DataFrame()
+    dealer, opexl, uppf, exd_tbl = margin_legs(cfg, product)
+    var = _slice(df, product, start, end)
+    rows = []
+    for st, g in s.groupby("station"):
+        vol = float(g["volume"].sum())
+        rev = float(g["revenue"].sum(min_count=1))
+        cogs = float(g["cogs"].sum(min_count=1))
+        gross = float(g["gross"].sum(min_count=1))
+        dc = float(g["dealer_cost"].sum())
+        ox = float(g["site_opex"].sum())
+        up = float(g["uppf_income"].sum())
+        net = float(g["net"].sum(min_count=1))
+        vs = var[var["station"] == st]["dip_var"].dropna()
+        vs = vs[vs.abs() <= cap]
+        lost_l = max(-float(vs.sum()), 0.0) if len(vs) else 0.0
+        unit_cost = (cogs / vol) if vol else np.nan
+        loss_cost = lost_l * unit_cost if (vol and not np.isnan(unit_cost)) else 0.0
+        cont = net - loss_cost
+        scfg = station_cfg(cfg, st)
+        days = max(int(g["date"].nunique()), 1)
+        fixed = float(scfg["opex_month"] or 0) * days / 30.0
+        npl = (cont / vol) if vol else np.nan
+        rows.append({
+            "station": st, "days": days, "volume": vol,
+            "avg_price": (rev / vol) if vol else np.nan,
+            "avg_cost": unit_cost, "revenue": rev, "cogs": cogs,
+            "gross_margin": gross, "gross_per_litre": (gross / vol) if vol else np.nan,
+            "dealer_cost": dc, "site_opex": ox, "uppf_income": up,
+            "net_margin": net, "loss_litres": lost_l, "loss_cost": loss_cost,
+            "contribution": cont, "net_per_litre": npl,
+            "fixed_cost": fixed, "profit": cont - fixed,
+            "breakeven_litres": (float(scfg["opex_month"]) / npl
+                                 if (npl and npl > 0 and scfg["opex_month"]) else np.nan),
+        })
+    res = pd.DataFrame(rows)
+    return res.sort_values("contribution", ascending=False).reset_index(drop=True) if len(res) else res
+
+
+def margin_by_month(df, product, cfg):
+    s = priced_frame(df, product, cfg, df["date"].min(), df["date"].max())
+    if s.empty:
+        return pd.DataFrame()
+    s["month"] = s["date"].dt.to_period("M").dt.to_timestamp()
+    g = s.groupby("month").agg(volume=("volume", "sum"), revenue=("revenue", "sum"),
+                               cogs=("cogs", "sum"), gross=("gross", "sum"),
+                               net=("net", "sum")).reset_index()
+    g["gross_per_litre"] = g["gross"] / g["volume"].replace(0, np.nan)
+    g["net_per_litre"] = g["net"] / g["volume"].replace(0, np.nan)
+    return g
+
+
+def margin_health(cfg, product):
+    """Is the commercial model configured well enough to trust the money numbers?"""
+    dealer, opexl, uppf, exd = margin_legs(cfg, product)
+    return {"has_cost": bool(exd), "cost_points": len(exd or {}),
+            "dealer": dealer, "opex": opexl, "uppf": uppf}
+
+
+# ────────────────────────── pricing & floor control ────────────────────────
+def compute_window_pricing(df, product, cfg, start, end):
+    """One row per pricing window: what we charged, what the floor was, what we
+    sold, and how volume responded to the price move."""
+    s = _slice(df, product, start, end).dropna(subset=["volume"]).copy()
+    if s.empty:
+        return pd.DataFrame()
+    s = add_windows(s)
+    floors = (cfg.get("floors") or {}).get(product, {})
+    dealer, opexl, uppf, exd_tbl = margin_legs(cfg, product)
+    rows = []
+    for ws, g in s.groupby("window_start"):
+        px = g["price"].dropna()
+        px = px[px > 0]
+        rows.append({
+            "window_start": ws, "window": window_label(ws),
+            "days": int(g["date"].nunique()),
+            "avg_price": float(px.mean()) if len(px) else np.nan,
+            "min_price": float(px.min()) if len(px) else np.nan,
+            "max_price": float(px.max()) if len(px) else np.nan,
+            "floor": dated_rate(floors, ws),
+            "exdepot": dated_rate(exd_tbl, ws),
+            "volume": float(g["volume"].sum()),
+            "stations": int(g["station"].nunique()),
+        })
+    w = pd.DataFrame(rows).sort_values("window_start").reset_index(drop=True)
+    w["daily_volume"] = w["volume"] / w["days"].replace(0, np.nan)
+    w["price_chg"] = w["avg_price"].diff()
+    w["price_chg_pct"] = w["avg_price"].pct_change() * 100
+    w["vol_chg_pct"] = w["daily_volume"].pct_change() * 100
+    w["headroom"] = w["avg_price"] - w["floor"]
+    w["unit_margin"] = w["avg_price"] - w["exdepot"] - (dealer + opexl - uppf)
+    w["window_margin"] = w["unit_margin"] * w["volume"]
+    # only meaningful when the price actually moved; a 0.001% move divides into noise
+    moved = w["price_chg_pct"].abs() >= 0.25
+    with np.errstate(divide="ignore", invalid="ignore"):
+        w["arc_elasticity"] = np.where(moved, w["vol_chg_pct"] / w["price_chg_pct"], np.nan)
+    return w
+
+
+def compute_floor_breaches(df, product, cfg, start, end, tol=0.005):
+    """Days where a site sold below the NPA minimum. Selling under the floor is a
+    licence matter, not just a margin one."""
+    floors = (cfg.get("floors") or {}).get(product, {})
+    if not floors:
+        return pd.DataFrame()
+    s = _slice(df, product, start, end).dropna(subset=["price"]).copy()
+    s = s[s["price"] > 0]
+    if s.empty:
+        return pd.DataFrame()
+    s["floor"] = s["date"].map(lambda d: dated_rate(floors, d))
+    s = s.dropna(subset=["floor"])
+    b = s[s["price"] < s["floor"] - tol].copy()
+    if b.empty:
+        return pd.DataFrame()
+    b["shortfall"] = b["floor"] - b["price"]
+    b["exposure"] = b["shortfall"] * b["volume"].fillna(0)
+    return (b[["date", "station", "price", "floor", "shortfall", "volume", "exposure"]]
+            .sort_values(["date", "station"]).reset_index(drop=True))
+
+
+def price_dispersion(df, product, as_of=None):
+    """Are all sites on the same price today? Spread across the network on the
+    latest priced day, which is where uncontrolled discounting shows up."""
+    s = df[(df["product"] == product)].dropna(subset=["price"])
+    s = s[s["price"] > 0]
+    if s.empty:
+        return pd.DataFrame(), np.nan
+    day = pd.Timestamp(as_of) if as_of is not None else s["date"].max()
+    latest = (s[s["date"] <= day].sort_values("date").groupby("station")
+                .tail(1)[["station", "date", "price", "volume"]]
+                .sort_values("price", ascending=False).reset_index(drop=True))
+    spread = float(latest["price"].max() - latest["price"].min()) if len(latest) else np.nan
+    return latest, spread
+
+
+def stock_revaluation(df, product, cfg, as_of=None):
+    """Every ex-depot move re-prices the litres already in our tanks. Positive =
+    we hold stock bought below the new cost (a windfall); negative = we are
+    holding expensive stock into a falling market."""
+    dealer, opexl, uppf, exd_tbl = margin_legs(cfg, product)
+    tbl = rate_table_frame(exd_tbl)
+    if tbl.empty or len(tbl) < 2:
+        return pd.DataFrame()
+    end = pd.Timestamp(as_of) if as_of is not None else df["date"].max()
+    tbl = tbl[tbl["effective_from"] <= end].sort_values("effective_from")
+    tbl["delta"] = tbl["value"].diff()
+    rows = []
+    for _, r in tbl.dropna(subset=["delta"]).iterrows():
+        d = r["effective_from"]
+        prev = d - pd.Timedelta(days=1)
+        s = df[(df["product"] == product) & (df["date"] <= prev)]
+        held = 0.0
+        for st, g in s.groupby("station"):
+            g = g.sort_values("date")
+            stock = g["dip"].dropna()
+            stock = stock.iloc[-1] if len(stock) else (g["closing"].dropna().iloc[-1]
+                                                       if g["closing"].notna().any() else np.nan)
+            if not np.isnan(stock):
+                held += float(stock)
+        if held <= 0:
+            continue
+        rows.append({"effective_from": d, "old_cost": r["value"] - r["delta"],
+                     "new_cost": r["value"], "delta": r["delta"],
+                     "stock_held": held, "revaluation": held * r["delta"]})
+    return pd.DataFrame(rows)
+
+
+# ───────────────────────── supply & replenishment ──────────────────────────
+def plan_trucks(qty, sizes, min_drop):
+    """Break a required volume into the compartment sizes actually available.
+    The last leg may be a part-load, which is how drops really work; anything
+    below the minimum economic drop is left for the next trip."""
+    sizes = sorted([s for s in (sizes or []) if s and s > 0], reverse=True)
+    if qty <= 0 or not sizes:
+        return [], 0.0
+    floor_qty = float(min_drop) if min_drop else sizes[-1] * 0.5
+    load, left = [], float(qty)
+    while left >= floor_qty and len(load) < 12:
+        pick = next((s for s in sizes if s <= left), None)
+        if pick is None:
+            pick = round(left / 500.0) * 500.0
+            if pick < floor_qty:
+                break
+        load.append(float(pick))
+        left -= pick
+    return load, float(sum(load))
+
+
+def compute_replenishment(df, product, cfg, as_of, window=RUNWAY_WINDOW):
+    """The load plan: who is closest to dry, how much ullage they have, and what
+    to put on the road."""
+    run = compute_runway(df, product, as_of, window)
+    if run.empty:
+        return pd.DataFrame()
+    log = cfg.get("logistics") or {}
+    sizes = log.get("brv_sizes") or [45000]
+    min_drop = float(log.get("min_drop") or 0)
+    reserve = float(log.get("ullage_reserve_pct") or 0) / 100.0
+    dealer, opexl, uppf, exd_tbl = margin_legs(cfg, product)
+    cost = dated_rate(exd_tbl, as_of)
+    rows = []
+    for _, r in run.iterrows():
+        sc = station_cfg(cfg, r["station"])
+        cap = float(sc.get(f"{product}_capacity") or 0)
+        stock = float(r["stock_litres"]) if not np.isnan(r["stock_litres"]) else np.nan
+        avg = float(r["avg_daily_sales"]) if not np.isnan(r["avg_daily_sales"]) else np.nan
+        usable = cap * (1 - reserve) if cap else np.nan
+        ullage = max(usable - stock, 0.0) if (cap and not np.isnan(stock)) else np.nan
+        lead = float(sc["lead_time_days"]) + float(sc["safety_days"])
+        rop = lead * avg if not np.isnan(avg) else np.nan
+        due = (stock <= rop) if (not np.isnan(rop) and not np.isnan(stock)) else None
+        load, planned = plan_trucks(ullage if not np.isnan(ullage) else 0.0, sizes, min_drop)
+        rows.append({
+            "station": r["station"], "stock_litres": stock, "capacity": cap,
+            "ullage": ullage, "fill_pct": (stock / cap * 100) if cap else np.nan,
+            "avg_daily_sales": avg, "days_cover": r["days_to_run_out"],
+            "reorder_point": rop, "order_now": due, "risk": r["risk"],
+            "suggested_order": planned, "truck_plan": " + ".join(f"{x:,.0f}" for x in load) or "—",
+            "order_value": planned * cost if not np.isnan(cost) else np.nan,
+            "as_of": r["as_of"],
+        })
+    res = pd.DataFrame(rows)
+    return res.sort_values("days_cover", na_position="last").reset_index(drop=True)
+
+
+def compute_delivery_perf(df, product, start, end):
+    """Discharge vs shortage on arrival — transit loss is money that never
+    reached the tank."""
+    s = _slice(df, product, start, end)
+    s = s[s["discharge"].fillna(0) > 0]
+    if s.empty:
+        return pd.DataFrame()
+    rows = []
+    for st, g in s.groupby("station"):
+        disch = float(g["discharge"].sum())
+        short = float(g["shortage"].dropna().sum())
+        drops = int(len(g))
+        gaps = g["date"].sort_values().diff().dropna().dt.days
+        gaps = gaps[gaps > 0]
+        rows.append({"station": st, "drops": drops, "discharged": disch,
+                     "avg_drop": disch / drops if drops else np.nan,
+                     "shortage": short,
+                     "loss_pct": (short / disch * 100) if disch else np.nan,
+                     "short_drops": int((g["shortage"].fillna(0) > 0).sum()),
+                     "avg_gap_days": float(gaps.mean()) if len(gaps) else np.nan})
+    return pd.DataFrame(rows).sort_values("loss_pct", ascending=False,
+                                          na_position="last").reset_index(drop=True)
+
+
+def delivery_log(df, product, start, end):
+    s = _slice(df, product, start, end)
+    s = s[s["discharge"].fillna(0) > 0]
+    cols = ["date", "station", "discharge", "shortage", "dip", "closing", "price"]
+    return s[cols].sort_values("date", ascending=False).reset_index(drop=True)
+
+
+# ───────────────────────── control & compliance ────────────────────────────
+def compute_submission(df, start, end):
+    """Daily returns discipline. A site that stops reporting is either closed or
+    hiding something; either way it needs a call."""
+    rows = []
+    for st, g in df[df["product"] == "PMS"].groupby("station"):
+        first = max(g["date"].min(), pd.Timestamp(start))
+        last = pd.Timestamp(end)
+        if first > last:
+            continue
+        span = pd.date_range(first, last, freq="D")
+        got = set(g[(g["date"] >= first) & (g["date"] <= last)]
+                  .dropna(subset=["volume"])["date"])
+        missing = [d for d in span if d not in got]
+        rows.append({"station": st, "expected": len(span), "submitted": len(span) - len(missing),
+                     "rate": (len(span) - len(missing)) / len(span) * 100 if len(span) else np.nan,
+                     "missing_days": len(missing),
+                     "last_return": max(got) if got else pd.NaT,
+                     "days_silent": (last - max(got)).days if got else np.nan,
+                     "missing_list": ", ".join(d.strftime("%d %b") for d in missing[-12:])})
+    res = pd.DataFrame(rows)
+    return res.sort_values("rate").reset_index(drop=True) if len(res) else res
+
+
+def wetstock_control(df, station, product, start, end, tol_pct=TOLERANCE_PCT,
+                     cap=DELIVERY_CAP):
+    """Cumulative variance against a tolerance band that widens with throughput.
+    A random error wanders around zero; a leak or a theft trends."""
+    s = _slice(df, product, start, end)
+    s = s[s["station"] == station].sort_values("date").copy()
+    s = s[s["dip_var"].notna() & (s["dip_var"].abs() <= cap)]
+    if s.empty:
+        return pd.DataFrame(), {}
+    s["cum_var"] = s["dip_var"].cumsum()
+    s["cum_thru"] = s["volume"].fillna(0).cumsum()
+    s["band"] = s["cum_thru"] * tol_pct / 100.0
+    last = s.iloc[-1]
+    breached = abs(last["cum_var"]) > last["band"] and last["band"] > 0
+    tail = s["dip_var"].tail(14)
+    drift = float(tail.mean()) if len(tail) else np.nan
+    persistent = bool(len(tail) >= 7 and (tail < 0).mean() >= 0.7)
+    verdict = ("leak or theft suspected" if breached and last["cum_var"] < 0 else
+               "unexplained gain — check delivery bookings" if breached else
+               "drifting negative" if persistent else "within control")
+    return s, {"cum_var": float(last["cum_var"]), "band": float(last["band"]),
+               "throughput": float(last["cum_thru"]), "breached": bool(breached),
+               "drift_lpd": drift, "persistent_negative": persistent, "verdict": verdict}
+
+
+def statutory_returns(df, cfg, year, month):
+    """Volume return in the shape NPA asks for: litres received and litres sold
+    by product, per site, for the month."""
+    s = pd.Timestamp(date(year, month, 1))
+    e = s + pd.offsets.MonthEnd(0)
+    rows = []
+    for rp in ("PMS", "AGO"):
+        g = _slice(df, rp, s, e)
+        for st, gg in g.groupby("station"):
+            rows.append({"station": st, "product": rp,
+                         "opening_litres": (gg.sort_values("date")["dip"].dropna().iloc[0]
+                                            if gg["dip"].notna().any() else np.nan),
+                         "received_litres": float(gg["discharge"].dropna().sum()),
+                         "sold_litres": float(gg["volume"].dropna().sum()),
+                         "closing_litres": (gg.sort_values("date")["dip"].dropna().iloc[-1]
+                                            if gg["dip"].notna().any() else np.nan),
+                         "days_reported": int(gg["volume"].notna().sum())})
+    r = pd.DataFrame(rows)
+    return r.sort_values(["station", "product"]).reset_index(drop=True) if len(r) else r
+
+
+def integrity_flags(df, product, start, end, cap=DELIVERY_CAP):
+    """Rows that should never happen in a clean book. Each one is a question for
+    the site, not a conviction."""
+    s = _slice(df, product, start, end).copy()
+    out = []
+    a = s[(s["volume"].fillna(0) > 0) & (s["dip"].isna()) & (s["closing"].isna())]
+    for _, r in a.iterrows():
+        out.append({"date": r["date"], "station": r["station"], "flag": "sales with no stock reading",
+                    "detail": f"{r['volume']:,.0f} L sold, no dip or closing recorded"})
+    b = s[s["dip_var"].abs() > cap]
+    for _, r in b.iterrows():
+        out.append({"date": r["date"], "station": r["station"], "flag": "unbooked delivery",
+                    "detail": f"dip variance {r['dip_var']:,.0f} L — delivery likely not entered"})
+    c = s[(s["discharge"].fillna(0) > 0) & (s["volume"].fillna(0) == 0)]
+    for _, r in c.iterrows():
+        out.append({"date": r["date"], "station": r["station"], "flag": "delivery, no sales",
+                    "detail": f"{r['discharge']:,.0f} L received but zero sales that day"})
+    d = s[(s["dip"].notna()) & (s["closing"].notna())]
+    d = d[(d["dip"] - d["closing"]).abs() > 1500]
+    for _, r in d.iterrows():
+        out.append({"date": r["date"], "station": r["station"], "flag": "dip vs book gap",
+                    "detail": f"dip {r['dip']:,.0f} L vs book {r['closing']:,.0f} L"})
+    e = s.sort_values(["station", "date"]).copy()
+    e["pchg"] = e.groupby("station")["price"].diff()
+    e = e[e["pchg"].abs() > 1.5]
+    for _, r in e.iterrows():
+        out.append({"date": r["date"], "station": r["station"], "flag": "large price step",
+                    "detail": f"price moved {r['pchg']:+,.2f} GHS/L in one day"})
+    res = pd.DataFrame(out)
+    return res.sort_values("date", ascending=False).reset_index(drop=True) if len(res) else res
+
+
+# ─────────────────── working capital & market position ─────────────────────
+def compute_stock_value(df, cfg, as_of, products=("PMS", "AGO")):
+    rows = []
+    for rp in products:
+        dealer, opexl, uppf, exd_tbl = margin_legs(cfg, rp)
+        cost = dated_rate(exd_tbl, as_of)
+        s = df[(df["product"] == rp) & (df["date"] <= pd.Timestamp(as_of))]
+        for st, g in s.groupby("station"):
+            g = g.sort_values("date")
+            stock = g["dip"].dropna()
+            stock = float(stock.iloc[-1]) if len(stock) else (
+                float(g["closing"].dropna().iloc[-1]) if g["closing"].notna().any() else np.nan)
+            v = g["volume"].dropna().tail(RUNWAY_WINDOW)
+            v = v[v > 0]
+            avg = float(v.mean()) if len(v) else np.nan
+            rows.append({"station": st, "product": rp, "stock_litres": stock,
+                         "unit_cost": cost,
+                         "stock_value": stock * cost if not (np.isnan(stock) or np.isnan(cost)) else np.nan,
+                         "avg_daily_sales": avg,
+                         "days_of_inventory": stock / avg if (avg and avg > 0 and not np.isnan(stock)) else np.nan})
+    return pd.DataFrame(rows)
+
+
+def compute_market_share(df, cfg):
+    nat = ((cfg.get("market") or {}).get("national_monthly_litres") or {})
+    if not nat:
+        return pd.DataFrame()
+    s = df[df["product"].isin(["PMS", "AGO"])].dropna(subset=["volume"]).copy()
+    s["month"] = s["date"].dt.to_period("M").astype(str)
+    g = s.groupby("month")["volume"].sum().reset_index(name="our_litres")
+    g["national_litres"] = g["month"].map(lambda m: float(nat.get(m, np.nan))
+                                          if nat.get(m) is not None else np.nan)
+    g["share_pct"] = g["our_litres"] / g["national_litres"] * 100
+    return g.dropna(subset=["national_litres"])
+
+
+def site_scorecard(df, cfg, station, start, end):
+    """Everything about one site on one page — the thing a territory manager
+    actually carries into a review meeting."""
+    card = {"station": station, "grades": {}}
+    sc = station_cfg(cfg, station)
+    card["profile"] = sc
+    for rp in ("PMS", "AGO"):
+        m = compute_margins(df, rp, cfg, start, end)
+        m = m[m["station"] == station]
+        run = compute_runway(df, rp, pd.Timestamp(end))
+        run = run[run["station"] == station]
+        eff = compute_efficiency(df, rp)
+        eff = eff[eff["station"] == station]
+        _, ctl = wetstock_control(df, station, rp, start, end,
+                                  float((cfg.get("control") or {}).get("tolerance_pct", TOLERANCE_PCT)))
+        card["grades"][rp] = {
+            "margin": m.iloc[0].to_dict() if len(m) else {},
+            "runway": run.iloc[0].to_dict() if len(run) else {},
+            "efficiency": eff.iloc[0].to_dict() if len(eff) else {},
+            "control": ctl,
+        }
+    return card
+
+
 # ─────────────────────────────────── theme ─────────────────────────────────
 CSS = """
 <style>
@@ -1571,10 +2204,1045 @@ def main():
         st.caption("Banking figures in GHS · Value = daily cash to bank · Balance Left is the "
                    "running unbanked balance carried forward.")
 
-    module = st.sidebar.radio("Module", ["STOCKS", "BANKING"], horizontal=True, key="module")
+    # ═══════════════════════════════════════════════════════════════════════
+    #                            OMC MODULES
+    # ═══════════════════════════════════════════════════════════════════════
+    if "omc_cfg" not in st.session_state:
+        st.session_state["omc_cfg"] = load_config()
+    cfg = st.session_state["omc_cfg"]
+    CO = (cfg.get("company") or {}).get("name") or "Spartan Fuel"
+    TOL = float((cfg.get("control") or {}).get("tolerance_pct", TOLERANCE_PCT))
+
+    def _acc(colour):
+        st.markdown(f"<style>:root{{--acc:{colour};}}</style>", unsafe_allow_html=True)
+
+    def _cards(items, colour):
+        cards = "".join(
+            f"<div class='kpi'><div class='l'>{l}</div>"
+            f"<div class='v'>{v}<span class='u'>{u}</span></div>"
+            f"<div class='s'>{s}</div><div class='tick' style='background:{colour}'></div></div>"
+            for l, v, u, s in items)
+        st.markdown(f"<div class='kpi-row'>{cards}</div>", unsafe_allow_html=True)
+
+    def phead(rp):
+        st.markdown(f"<div class='prodhead' style='--acc2:{COLORS.get(rp, PCOL.get(rp, INK))}'>"
+                    f"{GLABEL.get(rp, rp)}</div>", unsafe_allow_html=True)
+
+    def _hero(icon, title, meta, badge=None):
+        b = f"<span class='badge'>{badge}</span>" if badge else ""
+        st.markdown(f"<div class='hero'><h1>{icon} {CO} — {title}{b}</h1>"
+                    f"<div class='meta'>{meta}</div></div>", unsafe_allow_html=True)
+
+    def _period(key, label="Period", default=None):
+        d0, d1 = default or (dmin.date(), dmax.date())
+        v = st.sidebar.date_input(label, (d0, d1), min_value=dmin.date(),
+                                  max_value=dmax.date(), key=key)
+        if isinstance(v, (tuple, list)) and len(v) == 2:
+            return pd.Timestamp(v[0]), pd.Timestamp(v[1])
+        return dmin, dmax
+
+    def _refresh(key):
+        st.sidebar.divider()
+        if st.sidebar.button("↻ Refresh data", use_container_width=True, key=key):
+            st.cache_data.clear()
+            st.rerun()
+        st.sidebar.caption(f"Source: Google · sheet **{used_sheet}**")
+
+    def _n0(x):
+        return "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:,.0f}"
+
+    def _n2(x):
+        return "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:,.2f}"
+
+    def _cfg_gate(products):
+        """The money modules are only honest if the ex-depot cost table is filled."""
+        missing = [p for p in products if not margin_health(cfg, p)["has_cost"]]
+        if missing:
+            st.warning(
+                f"No ex-depot cost entered for **{', '.join(missing)}**, so revenue is the only "
+                "figure that can be trusted here — margin, cost and profit will read blank. "
+                "Open **⚙️ Settings → Commercial model** and enter what you pay the BDC per "
+                "litre, dated from the window it took effect.")
+        return not missing
+
+    # ══════════════════════════ MODULE · MARGINS ═══════════════════════════
+    def render_margins():
+        acc = "#C5821C"
+        _acc(acc)
+        st.sidebar.markdown("#### Margin period")
+        st.sidebar.markdown("<span class='note'>revenue at pump price, cost at ex-depot, "
+                            "less dealer margin, per-litre opex and the cost of stock "
+                            "losses.</span>", unsafe_allow_html=True)
+        ms, me = _period("mperiod", "Period", (cs_def, ce_def))
+        mfocus = st.sidebar.selectbox("Station focus", ["All stations"] + stations, key="mfocus")
+        _refresh("mrefresh")
+
+        _hero("💰", "Margin & Contribution",
+              f"{len(stations)} sites · {fmt(ms)} → {fmt(me)} · pump-to-depot economics",
+              badge="P&L")
+        _cfg_gate(["PMS", "AGO"])
+
+        mg = {rp: compute_margins(df, rp, cfg, ms, me) for rp in ("PMS", "AGO")}
+        allm = pd.concat([v.assign(product=k) for k, v in mg.items() if not v.empty],
+                         ignore_index=True) if any(not v.empty for v in mg.values()) else pd.DataFrame()
+        if allm.empty:
+            st.info("No sales rows in this period.")
+            return
+        sel = allm if mfocus == "All stations" else allm[allm["station"] == mfocus]
+
+        vol = sel["volume"].sum()
+        rev = sel["revenue"].sum(skipna=True)
+        gross = sel["gross_margin"].sum(skipna=True)
+        cont = sel["contribution"].sum(skipna=True)
+        losc = sel["loss_cost"].sum(skipna=True)
+        gpl = gross / vol if vol else np.nan
+        cpl = cont / vol if vol else np.nan
+
+        mtabs = st.tabs(["Overview", "By station", "Waterfall", "Monthly trend",
+                         "Break-even", "Working capital"])
+
+        with mtabs[0]:
+            st.markdown(f"<div class='eyebrow'>{mfocus} · PMS + AGO · {fmt(ms)} → {fmt(me)}</div>",
+                        unsafe_allow_html=True)
+            _cards([("Volume sold", _n0(vol), "L", "PMS + AGO"),
+                    ("Revenue", _n0(rev), "GHS", "at pump price"),
+                    ("Gross margin", _n0(gross), "GHS",
+                     f"{_n2(gpl)} GHS/L over ex-depot"),
+                    ("Contribution", _n0(cont), "GHS",
+                     f"{_n2(cpl)} GHS/L after dealer, opex &amp; losses")], acc)
+            loss_share = (losc / gross * 100) if (gross and gross == gross and gross > 0) else 0.0
+            verdict = ("healthy" if (cpl == cpl and cpl > 0.25) else
+                       "thin" if (cpl == cpl and cpl > 0) else "negative")
+            st.markdown(
+                f"<div class='summary'>💰 Every litre sold left <b>{_n2(cpl)} GHS</b> in the "
+                f"business after paying the depot, the dealer and per-litre running costs, and "
+                f"after writing off stock that went missing — a <b>{verdict}</b> margin. "
+                f"Stock losses alone cost <b>GHS {_n0(losc)}</b> in this period, which is "
+                f"{loss_share:,.1f}% of the gross margin earned."
+                "</div>", unsafe_allow_html=True)
+
+            by = allm.groupby("product").agg(volume=("volume", "sum"),
+                                             gross=("gross_margin", "sum"),
+                                             cont=("contribution", "sum")).reset_index()
+            c1, c2 = st.columns(2, gap="large")
+            with c1:
+                fig = go.Figure()
+                for _, r in by.iterrows():
+                    fig.add_bar(x=[GLABEL.get(r["product"], r["product"])], y=[r["cont"]],
+                                marker_color=COLORS.get(r["product"], acc),
+                                name=r["product"],
+                                text=[f"GHS {r['cont']:,.0f}"], textposition="outside")
+                fig.update_layout(title="Contribution by grade", showlegend=False)
+                fig.update_yaxes(title_text="GHS")
+                st.plotly_chart(style_fig(fig, 320, acc), use_container_width=True)
+            with c2:
+                by["per_litre"] = by["cont"] / by["volume"].replace(0, np.nan)
+                fig = go.Figure()
+                for _, r in by.iterrows():
+                    fig.add_bar(x=[GLABEL.get(r["product"], r["product"])], y=[r["per_litre"]],
+                                marker_color=COLORS.get(r["product"], acc),
+                                text=[f"{r['per_litre']:,.2f}"], textposition="outside")
+                fig.update_layout(title="Contribution per litre (GHS/L)", showlegend=False)
+                st.plotly_chart(style_fig(fig, 320, acc), use_container_width=True)
+
+        with mtabs[1]:
+            st.markdown("<div class='eyebrow'>Per-site commercial result</div>",
+                        unsafe_allow_html=True)
+            for rp in ("PMS", "AGO"):
+                d = mg[rp]
+                if d.empty:
+                    continue
+                phead(rp)
+                top = d.sort_values("contribution").tail(14)
+                fig = go.Figure()
+                fig.add_bar(y=top["station"], x=top["contribution"], orientation="h",
+                            marker_color=COLORS[rp],
+                            text=[f"{v:,.0f}" for v in top["contribution"]],
+                            textposition="outside", textfont=dict(color=INK, size=11),
+                            cliponaxis=False)
+                fig.update_layout(title=f"{GLABEL[rp]} — contribution by station (GHS)")
+                st.plotly_chart(style_fig(fig, max(280, 32 * len(top)), COLORS[rp]),
+                                use_container_width=True)
+                show = d.rename(columns={
+                    "station": "Station", "volume": "Litres", "avg_price": "Avg price",
+                    "avg_cost": "Avg ex-depot", "revenue": "Revenue", "gross_margin": "Gross",
+                    "gross_per_litre": "Gross/L", "dealer_cost": "Dealer",
+                    "site_opex": "Opex", "loss_cost": "Loss cost",
+                    "contribution": "Contribution", "net_per_litre": "Net/L"})
+                cols = ["Station", "Litres", "Avg price", "Avg ex-depot", "Revenue", "Gross",
+                        "Gross/L", "Dealer", "Opex", "Loss cost", "Contribution", "Net/L"]
+                st.dataframe(show[cols].style.format({
+                    "Litres": "{:,.0f}", "Avg price": "{:,.2f}", "Avg ex-depot": "{:,.2f}",
+                    "Revenue": "{:,.0f}", "Gross": "{:,.0f}", "Gross/L": "{:,.3f}",
+                    "Dealer": "{:,.0f}", "Opex": "{:,.0f}", "Loss cost": "{:,.0f}",
+                    "Contribution": "{:,.0f}", "Net/L": "{:,.3f}"}, na_rep="—"),
+                    use_container_width=True, hide_index=True)
+
+        with mtabs[2]:
+            st.markdown("<div class='eyebrow'>Where the cedi goes, per litre</div>",
+                        unsafe_allow_html=True)
+            rp = st.radio("Grade", ["PMS", "AGO"], horizontal=True, key="mwf")
+            d = mg[rp]
+            d = d if mfocus == "All stations" else d[d["station"] == mfocus]
+            if d.empty or not d["volume"].sum():
+                st.info("No litres for that selection.")
+            else:
+                v = d["volume"].sum()
+                pump = d["revenue"].sum() / v
+                cost = d["cogs"].sum() / v
+                dealer = d["dealer_cost"].sum() / v
+                opx = d["site_opex"].sum() / v
+                loss = d["loss_cost"].sum() / v
+                keep = pump - cost - dealer - opx - loss
+                fig = go.Figure(go.Waterfall(
+                    orientation="v",
+                    measure=["absolute", "relative", "relative", "relative", "relative", "total"],
+                    x=["Pump price", "Ex-depot cost", "Dealer margin", "Site opex",
+                       "Stock loss", "We keep"],
+                    y=[pump, -cost, -dealer, -opx, -loss, keep],
+                    text=[f"{pump:,.2f}", f"-{cost:,.2f}", f"-{dealer:,.2f}",
+                          f"-{opx:,.2f}", f"-{loss:,.3f}", f"{keep:,.3f}"],
+                    textposition="outside",
+                    connector={"line": {"color": "rgba(140,140,140,.35)"}},
+                    increasing={"marker": {"color": "#1F9D57"}},
+                    decreasing={"marker": {"color": "#B00020"}},
+                    totals={"marker": {"color": COLORS[rp]}}))
+                fig.update_layout(title=f"{GLABEL[rp]} — build-down of one litre (GHS)")
+                st.plotly_chart(style_fig(fig, 420, COLORS[rp]), use_container_width=True)
+                st.caption("Read left to right: what the customer pays, minus what we paid the "
+                           "BDC, minus what the dealer keeps, minus running cost per litre, "
+                           "minus the litres that disappeared — what is left is ours.")
+
+        with mtabs[3]:
+            st.markdown("<div class='eyebrow'>Margin over time</div>", unsafe_allow_html=True)
+            for rp in ("PMS", "AGO"):
+                mm = margin_by_month(df, rp, cfg)
+                if mm.empty:
+                    continue
+                phead(rp)
+                fig = make_subplots(specs=[[{"secondary_y": True}]])
+                fig.add_bar(x=mm["month"], y=mm["gross"], name="Gross margin (GHS)",
+                            marker_color=COLORS[rp], opacity=.75)
+                fig.add_scatter(x=mm["month"], y=mm["gross_per_litre"], name="GHS per litre",
+                                mode="lines+markers", line=dict(color=INK, width=2.5),
+                                secondary_y=True)
+                fig.update_layout(title=f"{GLABEL[rp]} — monthly margin and unit margin")
+                fig.update_yaxes(title_text="GHS", secondary_y=False)
+                fig.update_yaxes(title_text="GHS / litre", secondary_y=True, showgrid=False)
+                st.plotly_chart(style_fig(fig, 330, COLORS[rp]), use_container_width=True)
+
+        with mtabs[4]:
+            st.markdown("<div class='eyebrow'>Litres needed to cover fixed site cost</div>",
+                        unsafe_allow_html=True)
+            be = allm[allm["breakeven_litres"].notna()]
+            if be.empty:
+                st.info("Enter a monthly fixed cost per site in **⚙️ Settings → Sites** and the "
+                        "break-even volume for each one appears here.")
+            else:
+                be = be.assign(monthly_rate=be["volume"] / be["days"] * 30)
+                be["cover"] = be["monthly_rate"] / be["breakeven_litres"] * 100
+                bb = be.sort_values("cover")
+                fig = go.Figure()
+                fig.add_bar(y=bb["station"] + " · " + bb["product"], x=bb["cover"],
+                            orientation="h",
+                            marker_color=["#B00020" if c < 100 else "#1F9D57" for c in bb["cover"]],
+                            text=[f"{c:,.0f}%" for c in bb["cover"]], textposition="outside",
+                            textfont=dict(color=INK, size=11), cliponaxis=False)
+                fig.add_vline(x=100, line_dash="dash", line_color=INK)
+                fig.update_layout(title="Run-rate volume as % of break-even volume")
+                st.plotly_chart(style_fig(fig, max(300, 30 * len(bb)), acc),
+                                use_container_width=True)
+                show = be.rename(columns={"station": "Station", "product": "Grade",
+                                          "net_per_litre": "Net/L", "monthly_rate": "Run-rate L/mo",
+                                          "breakeven_litres": "Break-even L/mo", "cover": "Cover %",
+                                          "profit": "Profit after fixed (GHS)"})
+                st.dataframe(show[["Station", "Grade", "Net/L", "Run-rate L/mo",
+                                   "Break-even L/mo", "Cover %", "Profit after fixed (GHS)"]]
+                             .style.format({"Net/L": "{:,.3f}", "Run-rate L/mo": "{:,.0f}",
+                                            "Break-even L/mo": "{:,.0f}", "Cover %": "{:,.0f}",
+                                            "Profit after fixed (GHS)": "{:,.0f}"}, na_rep="—"),
+                             use_container_width=True, hide_index=True)
+
+        with mtabs[5]:
+            st.markdown("<div class='eyebrow'>Cash tied up in wet stock</div>",
+                        unsafe_allow_html=True)
+            sv = compute_stock_value(df, cfg, me)
+            if sv.empty or sv["stock_value"].isna().all():
+                st.info("Stock value needs an ex-depot cost in Settings.")
+            else:
+                tot = sv["stock_value"].sum(skipna=True)
+                doi = (sv["stock_litres"].sum(skipna=True) /
+                       sv["avg_daily_sales"].sum(skipna=True)) if sv["avg_daily_sales"].sum() else np.nan
+                _cards([("Stock on hand", _n0(sv["stock_litres"].sum(skipna=True)), "L",
+                         f"as at {fmt(me)}"),
+                        ("Value at cost", _n0(tot), "GHS", "working capital in tanks"),
+                        ("Days of inventory", _n2(doi), "days", "network average"),
+                        ("Sites dry-risk", _n0(int((sv["days_of_inventory"] < 2).sum())), "",
+                         "under 2 days of cover")], acc)
+                piv = sv.pivot_table(index="station", columns="product", values="stock_value",
+                                     aggfunc="sum").fillna(0)
+                piv["__t"] = piv.sum(axis=1)
+                piv = piv.sort_values("__t").drop(columns="__t")
+                fig = go.Figure()
+                for rp in ("PMS", "AGO"):
+                    if rp in piv.columns:
+                        fig.add_bar(y=piv.index, x=piv[rp], orientation="h", name=rp,
+                                    marker_color=COLORS[rp])
+                fig.update_layout(barmode="stack", title="Working capital held by site (GHS)")
+                st.plotly_chart(style_fig(fig, max(300, 32 * len(piv)), acc),
+                                use_container_width=True)
+                st.dataframe(sv.rename(columns={
+                    "station": "Station", "product": "Grade", "stock_litres": "Litres",
+                    "unit_cost": "Cost/L", "stock_value": "Value (GHS)",
+                    "avg_daily_sales": "Avg daily L", "days_of_inventory": "Days of stock"})
+                    .style.format({"Litres": "{:,.0f}", "Cost/L": "{:,.2f}",
+                                   "Value (GHS)": "{:,.0f}", "Avg daily L": "{:,.0f}",
+                                   "Days of stock": "{:,.1f}"}, na_rep="—"),
+                    use_container_width=True, hide_index=True)
+
+        st.download_button("⬇️ Download margin workbook",
+                           build_excel({f"margin_{k}": v for k, v in mg.items()}),
+                           file_name=f"margins_{ms:%Y%m%d}_{me:%Y%m%d}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # ══════════════════════════ MODULE · PRICING ═══════════════════════════
+    def render_pricing():
+        acc = "#3A6EA5"
+        _acc(acc)
+        st.sidebar.markdown("#### Pricing")
+        st.sidebar.markdown("<span class='note'>windows run 1–15 and 16–month end, the way "
+                            "NPA prices them.</span>", unsafe_allow_html=True)
+        ps, pe = _period("pperiod", "Period", (dmin.date(), dmax.date()))
+        _refresh("prefresh")
+
+        _hero("🏷️", "Pricing & Window Control",
+              f"{fmt(ps)} → {fmt(pe)} · floors, headroom and price response", badge="WINDOWS")
+
+        ptabs = st.tabs(["Window board", "Floor compliance", "Network price spread",
+                         "Price response", "Stock revaluation"])
+
+        with ptabs[0]:
+            for rp in ("PMS", "AGO"):
+                w = compute_window_pricing(df, rp, cfg, ps, pe)
+                if w.empty:
+                    continue
+                phead(rp)
+                fig = make_subplots(specs=[[{"secondary_y": True}]])
+                fig.add_bar(x=w["window"], y=w["daily_volume"], name="Litres / day",
+                            marker_color="rgba(58,110,165,.35)")
+                fig.add_scatter(x=w["window"], y=w["avg_price"], name="Our avg price",
+                                mode="lines+markers", line=dict(color=COLORS[rp], width=3),
+                                secondary_y=True)
+                if w["floor"].notna().any():
+                    fig.add_scatter(x=w["window"], y=w["floor"], name="NPA floor",
+                                    mode="lines", line=dict(color=INK, width=2, dash="dot"),
+                                    secondary_y=True)
+                fig.update_layout(title=f"{GLABEL[rp]} — price vs volume by pricing window")
+                fig.update_yaxes(title_text="litres / day", secondary_y=False)
+                fig.update_yaxes(title_text="GHS / litre", secondary_y=True, showgrid=False)
+                st.plotly_chart(style_fig(fig, 350, COLORS[rp]), use_container_width=True)
+                show = w.rename(columns={
+                    "window": "Window", "days": "Days", "avg_price": "Avg price",
+                    "floor": "NPA floor", "headroom": "Headroom", "exdepot": "Ex-depot",
+                    "unit_margin": "Unit margin", "volume": "Litres",
+                    "daily_volume": "L / day", "price_chg": "Price Δ",
+                    "vol_chg_pct": "Volume Δ%", "arc_elasticity": "Elasticity"})
+                st.dataframe(show[["Window", "Days", "Avg price", "NPA floor", "Headroom",
+                                   "Ex-depot", "Unit margin", "Litres", "L / day",
+                                   "Price Δ", "Volume Δ%", "Elasticity"]].style.format({
+                    "Avg price": "{:,.2f}", "NPA floor": "{:,.2f}", "Headroom": "{:,.2f}",
+                    "Ex-depot": "{:,.2f}", "Unit margin": "{:,.3f}", "Litres": "{:,.0f}",
+                    "L / day": "{:,.0f}", "Price Δ": "{:+,.2f}", "Volume Δ%": "{:+,.1f}",
+                    "Elasticity": "{:,.2f}"}, na_rep="—"),
+                    use_container_width=True, hide_index=True)
+            st.caption("Headroom is how far our pump price sits above the NPA minimum. Negative "
+                       "headroom means we were pricing under the floor for that window.")
+
+        with ptabs[1]:
+            st.markdown("<div class='eyebrow'>Selling below the NPA minimum</div>",
+                        unsafe_allow_html=True)
+            any_floor = any((cfg.get("floors") or {}).get(rp) for rp in ("PMS", "AGO"))
+            if not any_floor:
+                st.info("No price floors entered yet. Add each window's NPA minimum in "
+                        "**⚙️ Settings → Price floors** and every site-day below it is flagged "
+                        "here with the cedi exposure attached.")
+            else:
+                tot = 0.0
+                for rp in ("PMS", "AGO"):
+                    br = compute_floor_breaches(df, rp, cfg, ps, pe)
+                    phead(rp)
+                    if br.empty:
+                        st.success(f"No {rp} site-days below the floor in this period.")
+                        continue
+                    tot += br["exposure"].sum()
+                    st.error(f"{len(br)} site-day(s) under the floor across "
+                             f"{br['station'].nunique()} site(s) — GHS "
+                             f"{br['exposure'].sum():,.0f} of volume sold below the minimum.")
+                    st.dataframe(br.assign(date=br["date"].dt.strftime("%d %b %Y")).rename(columns={
+                        "date": "Date", "station": "Station", "price": "Our price",
+                        "floor": "Floor", "shortfall": "Under by", "volume": "Litres",
+                        "exposure": "Exposure (GHS)"}).style.format({
+                        "Our price": "{:,.2f}", "Floor": "{:,.2f}", "Under by": "{:,.2f}",
+                        "Litres": "{:,.0f}", "Exposure (GHS)": "{:,.0f}"}, na_rep="—"),
+                        use_container_width=True, hide_index=True)
+                if tot:
+                    st.caption("Exposure is the shortfall per litre multiplied by the litres sold "
+                               "at that price — the size of the pricing breach, and the number a "
+                               "regulator would ask about first.")
+
+        with ptabs[2]:
+            st.markdown("<div class='eyebrow'>Are all our sites on the same price?</div>",
+                        unsafe_allow_html=True)
+            for rp in ("PMS", "AGO"):
+                latest, spread = price_dispersion(df, rp)
+                if latest.empty:
+                    continue
+                phead(rp)
+                c1, c2 = st.columns([1, 2], gap="large")
+                with c1:
+                    st.metric("Network spread", f"{spread:,.2f} GHS/L")
+                    st.metric("Highest", f"{latest['price'].max():,.2f}")
+                    st.metric("Lowest", f"{latest['price'].min():,.2f}")
+                with c2:
+                    fig = go.Figure()
+                    fig.add_bar(y=latest["station"], x=latest["price"], orientation="h",
+                                marker_color=COLORS[rp],
+                                text=[f"{p:,.2f}" for p in latest["price"]],
+                                textposition="outside", textfont=dict(color=INK, size=11),
+                                cliponaxis=False)
+                    med = latest["price"].median()
+                    fig.add_vline(x=med, line_dash="dash", line_color=INK)
+                    fig.update_layout(title=f"{GLABEL[rp]} — latest pump price by site "
+                                            f"(dashed = network median)")
+                    fig.update_xaxes(range=[latest["price"].min() * 0.97,
+                                            latest["price"].max() * 1.03])
+                    st.plotly_chart(style_fig(fig, max(260, 30 * len(latest)), COLORS[rp]),
+                                    use_container_width=True)
+            st.caption("A wide spread is either deliberate territory pricing or a site quietly "
+                       "discounting. Both are worth knowing; only one is a decision.")
+
+        with ptabs[3]:
+            st.markdown("<div class='eyebrow'>What happened to volume when we moved price</div>",
+                        unsafe_allow_html=True)
+            for rp in ("PMS", "AGO"):
+                w = compute_window_pricing(df, rp, cfg, ps, pe).dropna(subset=["price_chg_pct"])
+                w = w[w["price_chg_pct"].abs() > 0.2]
+                if w.empty:
+                    continue
+                phead(rp)
+                fig = px.scatter(w, x="price_chg_pct", y="vol_chg_pct", text="window",
+                                 labels={"price_chg_pct": "price change %",
+                                         "vol_chg_pct": "daily volume change %"},
+                                 title=f"{GLABEL[rp]} — window-on-window price vs volume move")
+                fig.update_traces(marker=dict(size=13, color=COLORS[rp]),
+                                  textposition="top center", textfont=dict(size=9, color=INK))
+                fig.add_hline(y=0, line_color=AXIS)
+                fig.add_vline(x=0, line_color=AXIS)
+                st.plotly_chart(style_fig(fig, 380, COLORS[rp]), use_container_width=True)
+                med_e = w["arc_elasticity"].median()
+                if med_e == med_e:
+                    st.markdown(f"<div class='summary'>📈 Across these windows the typical "
+                                f"response was <b>{med_e:,.2f}</b> — {elast_brief(med_e)}"
+                                "</div>", unsafe_allow_html=True)
+
+        with ptabs[4]:
+            st.markdown("<div class='eyebrow'>Gain or loss on stock when depot cost moved</div>",
+                        unsafe_allow_html=True)
+            for rp in ("PMS", "AGO"):
+                rv = stock_revaluation(df, rp, cfg, pe)
+                if rv.empty:
+                    continue
+                phead(rp)
+                fig = go.Figure()
+                fig.add_bar(x=rv["effective_from"], y=rv["revaluation"],
+                            marker_color=["#1F9D57" if v > 0 else "#B00020"
+                                          for v in rv["revaluation"]],
+                            text=[f"{v:,.0f}" for v in rv["revaluation"]],
+                            textposition="outside", textfont=dict(color=INK, size=10))
+                fig.update_layout(title=f"{GLABEL[rp]} — revaluation of stock held at each "
+                                        f"ex-depot change (GHS)")
+                st.plotly_chart(style_fig(fig, 320, COLORS[rp]), use_container_width=True)
+                st.dataframe(rv.assign(effective_from=rv["effective_from"].dt.strftime("%d %b %Y"))
+                             .rename(columns={"effective_from": "Effective", "old_cost": "Old cost",
+                                              "new_cost": "New cost", "delta": "Δ GHS/L",
+                                              "stock_held": "Stock held (L)",
+                                              "revaluation": "Gain / (loss) GHS"})
+                             .style.format({"Old cost": "{:,.2f}", "New cost": "{:,.2f}",
+                                            "Δ GHS/L": "{:+,.2f}", "Stock held (L)": "{:,.0f}",
+                                            "Gain / (loss) GHS": "{:+,.0f}"}, na_rep="—"),
+                             use_container_width=True, hide_index=True)
+            st.caption("When the depot price rises, litres already in our tanks were bought "
+                       "cheaper — that is a real one-off gain. When it falls, we are carrying "
+                       "expensive stock into a cheaper market. Loading ahead of a window is worth "
+                       "exactly this number.")
+
+    # ══════════════════════════ MODULE · SUPPLY ════════════════════════════
+    def render_supply():
+        acc = "#7A0010"
+        _acc(acc)
+        st.sidebar.markdown("#### Supply")
+        st.sidebar.markdown("<span class='note'>load plan uses tank capacity, lead time and "
+                            "the last 7 days of sales.</span>", unsafe_allow_html=True)
+        ss_, se_ = _period("speriod", "Delivery history", (cs_def, ce_def))
+        _refresh("srefresh")
+
+        _hero("🚚", "Supply & Replenishment",
+              f"as at {fmt(dmax)} · ullage, reorder points and transit loss", badge="LOGISTICS")
+
+        stabs = st.tabs(["Load plan", "Ullage & cover", "Transit loss", "Delivery log"])
+
+        with stabs[0]:
+            st.markdown("<div class='eyebrow'>What to put on the road next</div>",
+                        unsafe_allow_html=True)
+            caps = sum(1 for s in stations
+                       if station_cfg(cfg, s)["PMS_capacity"] or station_cfg(cfg, s)["AGO_capacity"])
+            if caps == 0:
+                st.warning("No tank capacities on file, so ullage and order quantities can't be "
+                           "worked out. Enter each site's tank size in **⚙️ Settings → Sites** — "
+                           "days of cover below still works without it.")
+            for rp in ("PMS", "AGO"):
+                rep = compute_replenishment(df, rp, cfg, dmax)
+                if rep.empty:
+                    continue
+                phead(rp)
+                due = rep[rep["order_now"] == True]
+                if len(due):
+                    total = due["suggested_order"].sum()
+                    st.markdown(
+                        f"<div class='summary'>🚚 <b>{len(due)}</b> {rp} site(s) are at or below "
+                        f"their reorder point: <b>{', '.join(due['station'].head(6))}</b>. "
+                        f"Planned lift <b>{total:,.0f} L</b>"
+                        + (f" ≈ <b>GHS {due['order_value'].sum():,.0f}</b> at today's depot price."
+                           if due["order_value"].notna().any() else ".") + "</div>",
+                        unsafe_allow_html=True)
+                else:
+                    st.success(f"No {rp} site is below its reorder point today.")
+                show = rep.rename(columns={
+                    "station": "Station", "stock_litres": "Stock now", "capacity": "Capacity",
+                    "ullage": "Ullage", "fill_pct": "Tank %", "avg_daily_sales": "Avg daily",
+                    "days_cover": "Days cover", "reorder_point": "Reorder at",
+                    "order_now": "Order?", "suggested_order": "Suggested L",
+                    "truck_plan": "Compartments", "order_value": "Order value (GHS)"})
+                st.dataframe(show[["Station", "Stock now", "Capacity", "Tank %", "Ullage",
+                                   "Avg daily", "Days cover", "Reorder at", "Order?",
+                                   "Suggested L", "Compartments", "Order value (GHS)"]]
+                             .style.format({"Stock now": "{:,.0f}", "Capacity": "{:,.0f}",
+                                            "Tank %": "{:,.0f}", "Ullage": "{:,.0f}",
+                                            "Avg daily": "{:,.0f}", "Days cover": "{:,.1f}",
+                                            "Reorder at": "{:,.0f}", "Suggested L": "{:,.0f}",
+                                            "Order value (GHS)": "{:,.0f}"}, na_rep="—"),
+                             use_container_width=True, hide_index=True)
+
+        with stabs[1]:
+            st.markdown("<div class='eyebrow'>How full the network is</div>",
+                        unsafe_allow_html=True)
+            for rp in ("PMS", "AGO"):
+                rep = compute_replenishment(df, rp, cfg, dmax)
+                rep = rep[rep["capacity"] > 0] if not rep.empty else rep
+                if rep.empty:
+                    continue
+                phead(rp)
+                r = rep.sort_values("fill_pct")
+                fig = go.Figure()
+                fig.add_bar(y=r["station"], x=r["capacity"], orientation="h", name="Capacity",
+                            marker_color="rgba(140,140,140,.25)")
+                fig.add_bar(y=r["station"], x=r["stock_litres"], orientation="h", name="In tank",
+                            marker_color=COLORS[rp],
+                            text=[f"{v:,.0f}%" if v == v else "" for v in r["fill_pct"]],
+                            textposition="outside", textfont=dict(color=INK, size=10),
+                            cliponaxis=False)
+                fig.update_layout(barmode="overlay",
+                                  title=f"{GLABEL[rp]} — tank fill (label = % full)")
+                st.plotly_chart(style_fig(fig, max(280, 32 * len(r)), COLORS[rp]),
+                                use_container_width=True)
+
+        with stabs[2]:
+            st.markdown("<div class='eyebrow'>Litres that left the depot but never reached the "
+                        "tank</div>", unsafe_allow_html=True)
+            rows = []
+            for rp in ("PMS", "AGO"):
+                dp = compute_delivery_perf(df, rp, ss_, se_)
+                if dp.empty:
+                    continue
+                dealer, opexl, uppf, exd = margin_legs(cfg, rp)
+                cost = dated_rate(exd, se_)
+                dp = dp.assign(product=rp,
+                               loss_value=dp["shortage"] * (cost if cost == cost else np.nan))
+                rows.append(dp)
+                phead(rp)
+                fig = go.Figure()
+                d2 = dp.sort_values("loss_pct")
+                fig.add_bar(y=d2["station"], x=d2["loss_pct"], orientation="h",
+                            marker_color=COLORS[rp],
+                            text=[f"{v:,.2f}%" if v == v else "" for v in d2["loss_pct"]],
+                            textposition="outside", textfont=dict(color=INK, size=10),
+                            cliponaxis=False)
+                fig.update_layout(title=f"{GLABEL[rp]} — shortage as % of litres discharged")
+                st.plotly_chart(style_fig(fig, max(260, 30 * len(d2)), COLORS[rp]),
+                                use_container_width=True)
+                st.dataframe(dp.rename(columns={
+                    "station": "Station", "drops": "Drops", "discharged": "Discharged L",
+                    "avg_drop": "Avg drop", "shortage": "Shortage L", "loss_pct": "Loss %",
+                    "short_drops": "Short drops", "avg_gap_days": "Days between drops",
+                    "loss_value": "Cost (GHS)"})[["Station", "Drops", "Discharged L", "Avg drop",
+                                                  "Shortage L", "Loss %", "Short drops",
+                                                  "Days between drops", "Cost (GHS)"]]
+                    .style.format({"Discharged L": "{:,.0f}", "Avg drop": "{:,.0f}",
+                                   "Shortage L": "{:,.0f}", "Loss %": "{:,.2f}",
+                                   "Days between drops": "{:,.1f}", "Cost (GHS)": "{:,.0f}"},
+                                  na_rep="—"),
+                    use_container_width=True, hide_index=True)
+            if rows:
+                allp = pd.concat(rows, ignore_index=True)
+                tl = allp["shortage"].sum()
+                tv = allp["loss_value"].sum(skipna=True)
+                st.markdown(f"<div class='summary'>🚚 Transit shortage across the period: "
+                            f"<b>{tl:,.0f} L</b>"
+                            + (f" ≈ <b>GHS {tv:,.0f}</b>." if tv == tv and tv else ".")
+                            + " This is a claim against the transporter or the loading depot, not "
+                              "a station loss — it happens before the product reaches the "
+                              "forecourt.</div>", unsafe_allow_html=True)
+
+        with stabs[3]:
+            st.markdown("<div class='eyebrow'>Every discharge in the period</div>",
+                        unsafe_allow_html=True)
+            rp = st.radio("Grade", ["PMS", "AGO"], horizontal=True, key="dlog")
+            lg = delivery_log(df, rp, ss_, se_)
+            if lg.empty:
+                st.info("No discharges recorded for that grade in this period.")
+            else:
+                st.dataframe(lg.assign(date=lg["date"].dt.strftime("%d %b %Y")).rename(columns={
+                    "date": "Date", "station": "Station", "discharge": "Discharged L",
+                    "shortage": "Shortage L", "dip": "Dip after", "closing": "Book after",
+                    "price": "Price"}).style.format({
+                    "Discharged L": "{:,.0f}", "Shortage L": "{:,.0f}", "Dip after": "{:,.0f}",
+                    "Book after": "{:,.0f}", "Price": "{:,.2f}"}, na_rep="—"),
+                    use_container_width=True, hide_index=True, height=460)
+
+    # ══════════════════════ MODULE · CONTROL & COMPLIANCE ══════════════════
+    def render_control():
+        acc = "#1F9D57"
+        _acc(acc)
+        st.sidebar.markdown("#### Control period")
+        cs_, ce_ = _period("cperiod", "Period", (cs_def, ce_def))
+        _refresh("crefresh")
+
+        _hero("🛡️", "Control & Compliance",
+              f"{fmt(cs_)} → {fmt(ce_)} · wetstock, returns discipline and statutory volumes",
+              badge="CONTROL")
+
+        ctabs = st.tabs(["Wetstock control", "Returns discipline", "Integrity flags",
+                         "Statutory volume return"])
+
+        with ctabs[0]:
+            st.markdown("<div class='eyebrow'>Cumulative variance against tolerance</div>",
+                        unsafe_allow_html=True)
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                wsite = st.selectbox("Site", stations, key="wsite")
+            with c2:
+                wgrade = st.radio("Grade", ["PMS", "AGO"], horizontal=True, key="wgrade")
+            series, ctl = wetstock_control(df, wsite, wgrade, cs_, ce_, TOL)
+            if series.empty:
+                st.info("No usable dip-variance readings for that site and grade in this period.")
+            else:
+                _cards([("Cumulative variance", _n0(ctl["cum_var"]), "L",
+                         "sum of daily dip differences"),
+                        ("Tolerance band", f"±{_n0(ctl['band'])}", "L",
+                         f"{TOL}% of {_n0(ctl['throughput'])} L throughput"),
+                        ("Recent drift", _n2(ctl["drift_lpd"]), "L/day", "last 14 readings"),
+                        ("Verdict", ctl["verdict"].split()[0].title(), "",
+                         ctl["verdict"])], acc)
+                fig = go.Figure()
+                fig.add_scatter(x=series["date"], y=series["band"], name="Upper tolerance",
+                                mode="lines", line=dict(color=AXIS, width=1, dash="dot"))
+                fig.add_scatter(x=series["date"], y=-series["band"], name="Lower tolerance",
+                                mode="lines", line=dict(color=AXIS, width=1, dash="dot"),
+                                fill="tonexty", fillcolor="rgba(140,140,140,.10)")
+                fig.add_scatter(x=series["date"], y=series["cum_var"], name="Cumulative variance",
+                                mode="lines", line=dict(color=COLORS[wgrade], width=3))
+                fig.add_hline(y=0, line_color=AXIS)
+                fig.update_layout(title=f"{wsite} · {GLABEL[wgrade]} — wetstock control chart")
+                fig.update_yaxes(title_text="litres, cumulative")
+                st.plotly_chart(style_fig(fig, 380, COLORS[wgrade]), use_container_width=True)
+                if ctl["breached"] and ctl["cum_var"] < 0:
+                    st.error("Cumulative loss has broken the tolerance band and keeps falling. "
+                             "That pattern is a leak, a mis-calibrated pump or a systematic "
+                             "short-delivery — a one-off error would wander back toward zero.")
+                elif ctl["breached"]:
+                    st.warning("Cumulative variance is positive beyond tolerance, which usually "
+                               "means deliveries are reaching the tank without being booked.")
+                else:
+                    st.success("Variance is wandering inside tolerance — normal measurement noise.")
+
+            st.divider()
+            st.markdown("<div class='eyebrow'>Network control summary</div>",
+                        unsafe_allow_html=True)
+            rows = []
+            for stn in stations:
+                for rp in ("PMS", "AGO"):
+                    _, c = wetstock_control(df, stn, rp, cs_, ce_, TOL)
+                    if c:
+                        rows.append({"Station": stn, "Grade": rp, "Cumulative L": c["cum_var"],
+                                     "Tolerance ±L": c["band"], "Drift L/day": c["drift_lpd"],
+                                     "Status": c["verdict"]})
+            if rows:
+                cd = pd.DataFrame(rows).sort_values("Cumulative L")
+                st.dataframe(cd.style.format({"Cumulative L": "{:,.0f}", "Tolerance ±L": "{:,.0f}",
+                                              "Drift L/day": "{:,.1f}"}, na_rep="—"),
+                             use_container_width=True, hide_index=True)
+
+        with ctabs[1]:
+            st.markdown("<div class='eyebrow'>Are the sites sending their daily returns?</div>",
+                        unsafe_allow_html=True)
+            sub = compute_submission(df, cs_, ce_)
+            if sub.empty:
+                st.info("No sites in this period.")
+            else:
+                silent = sub[sub["days_silent"] >= 3]
+                _cards([("Network return rate", f"{sub['rate'].mean():,.0f}", "%",
+                         "days submitted vs expected"),
+                        ("Sites at 100%", _n0(int((sub["rate"] >= 99.9).sum())), "",
+                         "no missing days"),
+                        ("Silent 3+ days", _n0(len(silent)), "", "no return recently"),
+                        ("Missing days total", _n0(sub["missing_days"].sum()), "",
+                         "across the network")], acc)
+                if len(silent):
+                    st.warning("No returns for 3 days or more: **"
+                               + ", ".join(silent["station"]) + "**")
+                s2 = sub.sort_values("rate")
+                fig = go.Figure()
+                fig.add_bar(y=s2["station"], x=s2["rate"], orientation="h",
+                            marker_color=["#B00020" if r < 90 else "#C5821C" if r < 99
+                                          else "#1F9D57" for r in s2["rate"]],
+                            text=[f"{r:,.0f}%" for r in s2["rate"]], textposition="outside",
+                            textfont=dict(color=INK, size=11), cliponaxis=False)
+                fig.update_layout(title="Daily return submission rate by site")
+                fig.update_xaxes(range=[0, 108])
+                st.plotly_chart(style_fig(fig, max(280, 30 * len(s2)), acc),
+                                use_container_width=True)
+                st.dataframe(sub.assign(last_return=sub["last_return"].apply(
+                    lambda d: "—" if pd.isna(d) else pd.Timestamp(d).strftime("%d %b %Y"))).rename(
+                    columns={"station": "Station", "expected": "Expected days",
+                             "submitted": "Submitted", "rate": "Rate %",
+                             "missing_days": "Missing", "last_return": "Last return",
+                             "days_silent": "Days silent", "missing_list": "Recent gaps"})
+                    .style.format({"Rate %": "{:,.0f}", "Days silent": "{:,.0f}"}, na_rep="—"),
+                    use_container_width=True, hide_index=True)
+                st.caption("A site that stops reporting is invisible to every other number in "
+                           "this system — chase the gaps before reading the rankings.")
+
+        with ctabs[2]:
+            st.markdown("<div class='eyebrow'>Rows that need an explanation</div>",
+                        unsafe_allow_html=True)
+            parts = []
+            for rp in ("PMS", "AGO"):
+                fr = integrity_flags(df, rp, cs_, ce_)
+                if not fr.empty:
+                    parts.append(fr.assign(grade=rp))
+            flg = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+            if flg.empty:
+                st.success("Nothing anomalous in the book for this period.")
+            else:
+                counts = flg["flag"].value_counts()
+                _cards([(k[:22], _n0(v), "", "occurrences") for k, v in counts.head(4).items()], acc)
+                st.dataframe(flg.assign(date=flg["date"].dt.strftime("%d %b %Y")).rename(columns={
+                    "date": "Date", "station": "Station", "grade": "Grade", "flag": "Flag",
+                    "detail": "Detail"})[["Date", "Station", "Grade", "Flag", "Detail"]],
+                    use_container_width=True, hide_index=True, height=430)
+                st.caption("These are questions, not accusations. Most resolve as a delivery "
+                           "entered on the wrong day or a dip taken before the discharge settled.")
+
+        with ctabs[3]:
+            st.markdown("<div class='eyebrow'>Monthly volume return</div>",
+                        unsafe_allow_html=True)
+            months = pd.period_range(dmin.to_period("M"), dmax.to_period("M"), freq="M")
+            labels = [p.strftime("%B %Y") for p in months]
+            pick = st.selectbox("Return month", labels, index=len(labels) - 1, key="statmonth")
+            sel = months[labels.index(pick)]
+            ret = statutory_returns(df, cfg, sel.year, sel.month)
+            if ret.empty:
+                st.info("No data for that month.")
+            else:
+                tot = ret.groupby("product").agg(received=("received_litres", "sum"),
+                                                 sold=("sold_litres", "sum")).reset_index()
+                _cards([(f"{r['product']} received", _n0(r["received"]), "L", pick)
+                        for _, r in tot.iterrows()]
+                       + [(f"{r['product']} sold", _n0(r["sold"]), "L", pick)
+                          for _, r in tot.iterrows()], acc)
+                st.dataframe(ret.rename(columns={
+                    "station": "Station", "product": "Product", "opening_litres": "Opening L",
+                    "received_litres": "Received L", "sold_litres": "Sold L",
+                    "closing_litres": "Closing L", "days_reported": "Days reported"})
+                    .style.format({"Opening L": "{:,.0f}", "Received L": "{:,.0f}",
+                                   "Sold L": "{:,.0f}", "Closing L": "{:,.0f}"}, na_rep="—"),
+                    use_container_width=True, hide_index=True)
+                st.download_button("⬇️ Download volume return (Excel)",
+                                   build_excel({f"return_{sel.strftime('%Y_%m')}": ret}),
+                                   file_name=f"volume_return_{sel.strftime('%Y_%m')}.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument."
+                                        "spreadsheetml.sheet")
+                st.caption("Opening and closing are physical dips, received is booked discharge "
+                           "and sold is metered sales. Reconcile these before they go anywhere "
+                           "official.")
+
+    # ══════════════════════════ MODULE · SITE CARD ═════════════════════════
+    def render_site():
+        acc = "#0F766E"
+        _acc(acc)
+        st.sidebar.markdown("#### Site review")
+        sst, sse = _period("siteperiod", "Period", (cs_def, ce_def))
+        who = st.sidebar.selectbox("Site", stations, key="sitepick")
+        _refresh("siterefresh")
+
+        sc = station_cfg(cfg, who)
+        meta = " · ".join(x for x in [sc.get("region") or "", sc.get("dealer") or "",
+                                      f"{fmt(sst)} → {fmt(sse)}"] if x)
+        _hero("🏪", who, meta, badge="SITE CARD")
+
+        card = site_scorecard(df, cfg, who, sst, sse)
+        tot_vol = sum((card["grades"][rp]["margin"].get("volume") or 0) for rp in ("PMS", "AGO"))
+        tot_con = sum((card["grades"][rp]["margin"].get("contribution") or 0) for rp in ("PMS", "AGO"))
+        worst = min([card["grades"][rp]["runway"].get("days_to_run_out", np.nan)
+                     for rp in ("PMS", "AGO")], default=np.nan)
+        loss = sum((card["grades"][rp]["margin"].get("loss_cost") or 0) for rp in ("PMS", "AGO"))
+        _cards([("Volume", _n0(tot_vol), "L", "both grades, this period"),
+                ("Contribution", _n0(tot_con), "GHS", "after dealer, opex and losses"),
+                ("Lowest cover", _n2(worst), "days", "grade closest to dry"),
+                ("Stock loss cost", _n0(loss), "GHS", "value of missing litres")], acc)
+
+        for rp in ("PMS", "AGO"):
+            g = card["grades"][rp]
+            phead(rp)
+            m, r, e, c = g["margin"], g["runway"], g["efficiency"], g["control"]
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Litres", _n0(m.get("volume")))
+            c2.metric("Contribution/L", _n2(m.get("net_per_litre")))
+            c3.metric("Days cover", _n2(r.get("days_to_run_out")))
+            c4.metric("Sell-through", f"{(e.get('turnover_per_day') or 0) * 100:,.1f}%")
+            bits = []
+            if m.get("volume"):
+                bits.append(f"Sold <b>{m['volume']:,.0f} L</b> at an average of "
+                            f"<b>{m.get('avg_price', float('nan')):,.2f} GHS/L</b>")
+                if m.get("net_per_litre") == m.get("net_per_litre"):
+                    bits.append(f"keeping <b>{m['net_per_litre']:,.3f} GHS</b> a litre")
+            if r.get("days_to_run_out") == r.get("days_to_run_out"):
+                bits.append(f"about <b>{r['days_to_run_out']:,.1f} days</b> of stock left "
+                            f"({r.get('risk', '')})")
+            if c:
+                bits.append(f"wetstock is <b>{c.get('verdict', '')}</b>")
+            if bits:
+                st.markdown("<div class='summary'>" + ", ".join(bits) + ".</div>",
+                            unsafe_allow_html=True)
+            hist = df[(df["station"] == who) & (df["product"] == rp) &
+                      (df["date"] >= sst) & (df["date"] <= sse)].dropna(subset=["volume"])
+            if not hist.empty:
+                fig = make_subplots(specs=[[{"secondary_y": True}]])
+                fig.add_bar(x=hist["date"], y=hist["volume"], name="Litres",
+                            marker_color=COLORS[rp], opacity=.65)
+                if hist["price"].notna().any():
+                    fig.add_scatter(x=hist["date"], y=hist["price"], name="Price",
+                                    mode="lines", line=dict(color=INK, width=2),
+                                    secondary_y=True)
+                fig.update_layout(title=f"{GLABEL[rp]} — daily volume and price")
+                fig.update_yaxes(title_text="litres", secondary_y=False)
+                fig.update_yaxes(title_text="GHS/L", secondary_y=True, showgrid=False)
+                st.plotly_chart(style_fig(fig, 300, COLORS[rp]), use_container_width=True)
+
+        st.divider()
+        st.markdown("<div class='eyebrow'>Site register</div>", unsafe_allow_html=True)
+        st.dataframe(pd.DataFrame([{"Field": k.replace("_", " ").title(), "Value": v}
+                                   for k, v in sc.items()]),
+                     use_container_width=True, hide_index=True)
+
+    # ══════════════════════════ MODULE · SETTINGS ══════════════════════════
+    def render_settings():
+        acc = "#555C66"
+        _acc(acc)
+        _hero("⚙️", "Settings",
+              "the commercial numbers behind every money figure in this system", badge="CONFIG")
+        st.caption(f"Stored in `{CONFIG_PATH}`. Nothing here is guessed — enter your own "
+                   "figures from the current pricing window and the invoices you actually pay.")
+
+        etabs = st.tabs(["Commercial model", "Price floors", "Sites", "Logistics & control",
+                         "Company", "Raw JSON"])
+
+        with etabs[0]:
+            st.markdown("<div class='eyebrow'>Per-litre economics by grade</div>",
+                        unsafe_allow_html=True)
+            for rp in ("PMS", "AGO"):
+                phead(rp)
+                ec = cfg["economics"].setdefault(rp, {})
+                c1, c2, c3 = st.columns(3)
+                ec["dealer_margin"] = c1.number_input(
+                    f"{rp} dealer margin (GHS/L)", value=float(ec.get("dealer_margin") or 0),
+                    step=0.01, format="%.4f", key=f"dm_{rp}")
+                ec["opex_per_litre"] = c2.number_input(
+                    f"{rp} opex per litre (GHS/L)", value=float(ec.get("opex_per_litre") or 0),
+                    step=0.01, format="%.4f", key=f"ox_{rp}",
+                    help="Haulage, marking, site overhead and shrinkage allowance, per litre.")
+                ec["uppf_recovery"] = c3.number_input(
+                    f"{rp} UPPF recovery (GHS/L)", value=float(ec.get("uppf_recovery") or 0),
+                    step=0.01, format="%.4f", key=f"up_{rp}",
+                    help="Leave at zero unless you actually claim and receive it.")
+                st.markdown(f"<span class='note'>{rp} ex-depot cost — what the BDC invoices you "
+                            "per litre. Add a row each time it changes; the date is the day it "
+                            "took effect.</span>", unsafe_allow_html=True)
+                cur = rate_table_frame(ec.get("exdepot", {}))
+                if cur.empty:
+                    cur = pd.DataFrame({"effective_from": pd.Series(dtype="datetime64[ns]"),
+                                        "value": pd.Series(dtype=float)})
+                ed = st.data_editor(cur, num_rows="dynamic", use_container_width=True,
+                                    key=f"exd_{rp}",
+                                    column_config={
+                                        "effective_from": st.column_config.DateColumn("Effective from"),
+                                        "value": st.column_config.NumberColumn(
+                                            "Ex-depot GHS/L", format="%.4f")})
+                ec["exdepot"] = {pd.Timestamp(r["effective_from"]).strftime("%Y-%m-%d"): float(r["value"])
+                                 for _, r in ed.iterrows()
+                                 if pd.notna(r.get("effective_from")) and pd.notna(r.get("value"))}
+
+        with etabs[1]:
+            st.markdown("<div class='eyebrow'>NPA minimum pump price by window</div>",
+                        unsafe_allow_html=True)
+            st.markdown("<span class='note'>Enter the floor published for each pricing window. "
+                        "Use the window start date — 1st or 16th.</span>", unsafe_allow_html=True)
+            for rp in ("PMS", "AGO"):
+                phead(rp)
+                cur = rate_table_frame((cfg.get("floors") or {}).get(rp, {}))
+                if cur.empty:
+                    cur = pd.DataFrame({"effective_from": pd.Series(dtype="datetime64[ns]"),
+                                        "value": pd.Series(dtype=float)})
+                fd = st.data_editor(cur, num_rows="dynamic", use_container_width=True,
+                                    key=f"flr_{rp}",
+                                    column_config={
+                                        "effective_from": st.column_config.DateColumn("Window start"),
+                                        "value": st.column_config.NumberColumn(
+                                            "Floor GHS/L", format="%.4f")})
+                cfg.setdefault("floors", {})[rp] = {
+                    pd.Timestamp(r["effective_from"]).strftime("%Y-%m-%d"): float(r["value"])
+                    for _, r in fd.iterrows()
+                    if pd.notna(r.get("effective_from")) and pd.notna(r.get("value"))}
+
+        with etabs[2]:
+            st.markdown("<div class='eyebrow'>Site register</div>", unsafe_allow_html=True)
+            st.markdown("<span class='note'>Tank capacity drives ullage and order quantities. "
+                        "Monthly fixed cost drives break-even. Lead time drives the reorder "
+                        "point.</span>", unsafe_allow_html=True)
+            reg = pd.DataFrame([dict(station=s, **station_cfg(cfg, s)) for s in stations])
+            ed = st.data_editor(reg, use_container_width=True, key="sitereg",
+                                disabled=["station"],
+                                column_config={
+                                    "station": st.column_config.TextColumn("Station"),
+                                    "PMS_capacity": st.column_config.NumberColumn(
+                                        "PMS tank (L)", format="%.0f"),
+                                    "AGO_capacity": st.column_config.NumberColumn(
+                                        "AGO tank (L)", format="%.0f"),
+                                    "opex_month": st.column_config.NumberColumn(
+                                        "Fixed cost / month (GHS)", format="%.0f"),
+                                    "lead_time_days": st.column_config.NumberColumn(
+                                        "Lead time (days)", format="%.1f"),
+                                    "safety_days": st.column_config.NumberColumn(
+                                        "Safety stock (days)", format="%.1f"),
+                                    "region": st.column_config.TextColumn("Region"),
+                                    "dealer": st.column_config.TextColumn("Dealer")})
+            def _cast(v):
+                if isinstance(v, str) or v is None:
+                    return v or ""
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return str(v)
+            cfg["stations"] = {str(r["station"]): {k: _cast(v) for k, v in r.items()
+                                                   if k != "station"}
+                               for _, r in ed.iterrows()}
+
+        with etabs[3]:
+            st.markdown("<div class='eyebrow'>Haulage and control limits</div>",
+                        unsafe_allow_html=True)
+            log = cfg.setdefault("logistics", {})
+            c1, c2, c3 = st.columns(3)
+            sizes = c1.text_input("BRV compartment sizes (L, comma separated)",
+                                  ", ".join(str(int(x)) for x in (log.get("brv_sizes") or [])),
+                                  key="brv")
+            log["brv_sizes"] = [float(x.strip()) for x in sizes.split(",")
+                                if x.strip().replace(".", "").isdigit()]
+            log["min_drop"] = c2.number_input("Minimum economic drop (L)",
+                                              value=float(log.get("min_drop") or 0), step=500.0,
+                                              key="mindrop")
+            log["ullage_reserve_pct"] = c3.number_input(
+                "Ullage reserve (%)", value=float(log.get("ullage_reserve_pct") or 0),
+                step=1.0, key="ullres",
+                help="Headroom never planned into a load, for expansion and dip error.")
+            ctlc = cfg.setdefault("control", {})
+            ctlc["tolerance_pct"] = st.number_input(
+                "Wetstock tolerance (% of throughput)",
+                value=float(ctlc.get("tolerance_pct") or TOLERANCE_PCT), step=0.05,
+                format="%.2f", key="tolpct",
+                help="Cumulative variance beyond this band is treated as a control failure "
+                     "rather than measurement noise.")
+
+        with etabs[4]:
+            comp = cfg.setdefault("company", {})
+            c1, c2 = st.columns(2)
+            comp["name"] = c1.text_input("Company name", value=comp.get("name", ""), key="cname")
+            comp["npa_licence"] = c2.text_input("NPA licence no.",
+                                                value=comp.get("npa_licence", ""), key="clic")
+            comp["supplier_bdc"] = st.text_input("Supplying BDC",
+                                                 value=comp.get("supplier_bdc", ""), key="cbdc")
+            st.markdown("<div class='eyebrow'>National monthly consumption (optional)</div>",
+                        unsafe_allow_html=True)
+            st.markdown("<span class='note'>Enter NPA industry volumes to see our share of the "
+                        "market by month.</span>", unsafe_allow_html=True)
+            mk = (cfg.setdefault("market", {}).setdefault("national_monthly_litres", {}))
+            mrows = pd.DataFrame([{"month": k, "litres": v} for k, v in sorted(mk.items())]) \
+                if mk else pd.DataFrame({"month": pd.Series(dtype=str),
+                                         "litres": pd.Series(dtype=float)})
+            med = st.data_editor(mrows, num_rows="dynamic", use_container_width=True, key="mktvol",
+                                 column_config={
+                                     "month": st.column_config.TextColumn("Month (YYYY-MM)"),
+                                     "litres": st.column_config.NumberColumn("National litres",
+                                                                             format="%.0f")})
+            cfg["market"]["national_monthly_litres"] = {
+                str(r["month"]): float(r["litres"]) for _, r in med.iterrows()
+                if pd.notna(r.get("month")) and pd.notna(r.get("litres"))}
+            share = compute_market_share(df, cfg)
+            if not share.empty:
+                fig = px.line(share, x="month", y="share_pct", markers=True,
+                              title="Our share of national volume (%)")
+                fig.update_traces(line=dict(color=acc, width=3))
+                st.plotly_chart(style_fig(fig, 300, acc), use_container_width=True)
+
+        with etabs[5]:
+            st.markdown("<div class='eyebrow'>Everything, as stored</div>", unsafe_allow_html=True)
+            st.code(json.dumps(cfg, indent=2, sort_keys=True), language="json")
+
+        st.divider()
+        c1, c2 = st.columns([1, 3])
+        if c1.button("💾 Save settings", use_container_width=True, key="savecfg"):
+            try:
+                p = save_config(cfg)
+                st.session_state["omc_cfg"] = cfg
+                st.success(f"Saved to {p}. Every money figure in the system now uses these.")
+            except Exception as e:
+                st.error(f"Couldn't write the config file: {e}")
+        c2.caption("Changes apply to this session immediately; save to keep them for next time.")
+
+    # ═══════════════════════════ module dispatch ═══════════════════════════
+    MODULES = {
+        "⛽ Stocks & Sales": None,
+        "💰 Margins": render_margins,
+        "🏷️ Pricing": render_pricing,
+        "🚚 Supply": render_supply,
+        "🛡️ Control": render_control,
+        "🏪 Site card": render_site,
+        "🏦 Banking": render_banking,
+        "⚙️ Settings": render_settings,
+    }
+    module = st.sidebar.radio("Module", list(MODULES), key="module")
     st.sidebar.divider()
-    if module == "BANKING":
-        render_banking()
+    if MODULES[module] is not None:
+        MODULES[module]()
         return
 
     with st.sidebar:
