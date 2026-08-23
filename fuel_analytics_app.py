@@ -48,6 +48,7 @@ Only the MASTER tab is used.
 import io
 import os
 import re
+from pathlib import Path
 import math
 import base64
 from datetime import datetime, date, timedelta
@@ -1231,7 +1232,32 @@ def build_report_pdf(meta, per_product):
 import json
 import copy
 
-CONFIG_PATH = os.getenv("OMC_CONFIG", "omc_config.json")
+# Where the config lives. A bare relative name resolves against the process
+# working directory, which is NOT reliably the folder holding this script —
+# on Streamlit Community Cloud it is the repo root, and if the app sits in a
+# subfolder the file is silently missed. So we search a list of candidates and
+# remember exactly what we tried, because "it didn't pick it up" with no
+# explanation is the worst possible failure mode.
+CONFIG_ENV = os.getenv("OMC_CONFIG")
+CONFIG_PATH = CONFIG_ENV or "omc_config.json"
+CONFIG_LOAD = {"path": None, "error": None, "tried": [], "source": "defaults"}
+
+
+def config_candidates():
+    here = Path(__file__).resolve().parent
+    names = []
+    if CONFIG_ENV:
+        names.append(Path(CONFIG_ENV))
+    for base in (here, here.parent, Path.cwd()):
+        names.append(base / "omc_config.json")
+        names.append(base / "config" / "omc_config.json")
+    seen, out = set(), []
+    for n in names:
+        r = str(n)
+        if r not in seen:
+            seen.add(r)
+            out.append(n)
+    return out
 TOLERANCE_PCT = 0.5          # wetstock control limit, % of cumulative throughput
 WINDOW_DAY = 15              # Ghana pricing windows: 1–15 and 16–month end
 
@@ -1246,13 +1272,17 @@ DEFAULT_CONFIG = {
     # window; the margins are the fixed pesewas-per-litre legs of the build-up.
     "economics": {
         "PMS": {
-            "exdepot": {},            # "YYYY-MM-DD" -> GHS/L invoiced by the BDC
+            "exdepot": {},            # optional override, "YYYY-MM-DD" -> GHS/L all-in
+            "exdepot_base": {},       # BDC selling price before duties, GHS/L
+            "tax": {},                # duties + levies per litre, GHS/L
             "dealer_margin": 0.0,     # GHS/L paid out to the dealer / operator
             "opex_per_litre": 0.0,    # GHS/L haulage, marking, site overhead, shrink allowance
             "uppf_recovery": 0.0,     # GHS/L recovered on approved routes, 0 if not claimed
         },
         "AGO": {
             "exdepot": {},
+            "exdepot_base": {},
+            "tax": {},
             "dealer_margin": 0.0,
             "opex_per_litre": 0.0,
             "uppf_recovery": 0.0,
@@ -1293,18 +1323,73 @@ def _deep_merge(base, over):
     return out
 
 
-def load_config(path=CONFIG_PATH):
+def load_config(path=None):
+    """Find and read the config. Never raises, but always records what happened
+    in CONFIG_LOAD so the Settings screen can tell you why nothing appeared."""
+    CONFIG_LOAD["tried"] = []
+    CONFIG_LOAD["error"] = None
+    CONFIG_LOAD["path"] = None
+    CONFIG_LOAD["source"] = "defaults"
+
+    candidates = [Path(path)] if path else config_candidates()
+    for cand in candidates:
+        CONFIG_LOAD["tried"].append(str(cand))
+        try:
+            if not cand.is_file():
+                continue
+            with open(cand, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except json.JSONDecodeError as e:
+            # A malformed file is a real error and must not be swallowed —
+            # silently falling back to defaults is how a bad edit goes unnoticed.
+            CONFIG_LOAD["error"] = f"{cand} is not valid JSON: {e}"
+            continue
+        except Exception as e:
+            CONFIG_LOAD["error"] = f"couldn't read {cand}: {e}"
+            continue
+        CONFIG_LOAD["path"] = str(cand)
+        CONFIG_LOAD["source"] = "file"
+        return _deep_merge(DEFAULT_CONFIG, data)
+
+    # Streamlit Community Cloud has no writable, persistent disk. Pasting the
+    # whole config into Secrets as omc_config = '''{...}''' works there.
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return _deep_merge(DEFAULT_CONFIG, json.load(fh))
-    except Exception:
-        return copy.deepcopy(DEFAULT_CONFIG)
+        import streamlit as _st
+        blob = _st.secrets.get("omc_config") if hasattr(_st, "secrets") else None
+        if blob:
+            data = json.loads(blob) if isinstance(blob, str) else dict(blob)
+            CONFIG_LOAD["path"] = "st.secrets['omc_config']"
+            CONFIG_LOAD["source"] = "secrets"
+            return _deep_merge(DEFAULT_CONFIG, data)
+    except Exception as e:
+        if CONFIG_LOAD["error"] is None:
+            CONFIG_LOAD["error"] = f"secrets lookup failed: {e}"
+
+    if CONFIG_LOAD["error"] is None:
+        CONFIG_LOAD["error"] = "no omc_config.json found in any of the paths tried"
+    return copy.deepcopy(DEFAULT_CONFIG)
 
 
-def save_config(cfg, path=CONFIG_PATH):
-    with open(path, "w", encoding="utf-8") as fh:
+def config_is_ephemeral():
+    """True when we're somewhere the filesystem resets — Streamlit Community
+    Cloud rebuilds the container on every reboot, so Save writes a file that
+    will not survive. Better to say so than to let a save quietly evaporate."""
+    return any(os.getenv(v) for v in ("STREAMLIT_SHARING_MODE", "STREAMLIT_SERVER_PORT")) \
+        and not os.access(str(Path(__file__).resolve().parent), os.W_OK)
+
+
+def save_config(cfg, path=None):
+    target = Path(path) if path else Path(CONFIG_LOAD.get("path") or "")
+    if not path and (not target or CONFIG_LOAD.get("source") != "file"):
+        target = Path(__file__).resolve().parent / "omc_config.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as fh:
         json.dump(cfg, fh, indent=2, sort_keys=True)
-    return path
+    return str(target)
+
+
+def config_bytes(cfg):
+    return json.dumps(cfg, indent=2, sort_keys=True).encode("utf-8")
 
 
 def station_cfg(cfg, station):
@@ -1380,10 +1465,38 @@ def window_index(dmin, dmax):
 
 
 # ───────────────────────────── margin engine ───────────────────────────────
+def resolved_exdepot(cfg, product):
+    """Ex-depot cost per litre = what the BDC charges, plus the duties and levies
+    that ride on it. Keeping the two apart matters: the base price moves with
+    every lifting, the tax moves when policy moves, and mixing them into one
+    number means a levy change forces you to re-enter hundreds of prices.
+
+    An explicit `exdepot` entry always wins, so a known invoice figure can
+    override the computed one for any date.
+    """
+    ec = (cfg.get("economics") or {}).get(product, {}) or {}
+    legacy = ec.get("exdepot") or {}
+    base = ec.get("exdepot_base") or {}
+    tax = ec.get("tax") or {}
+    if not base and not tax:
+        return legacy
+    out = dict(legacy)
+    for k in sorted(set(base) | set(tax)):
+        if k in out:
+            continue
+        b = dated_rate(base, k)
+        if np.isnan(b):
+            continue
+        t = dated_rate(tax, k, default=0.0)
+        out[k] = round(float(b) + (0.0 if np.isnan(t) else float(t)), 4)
+    return out
+
+
 def margin_legs(cfg, product):
     ec = (cfg.get("economics") or {}).get(product, {}) or {}
     f = lambda k: float(ec.get(k) or 0.0)
-    return f("dealer_margin"), f("opex_per_litre"), f("uppf_recovery"), (ec.get("exdepot") or {})
+    return (f("dealer_margin"), f("opex_per_litre"), f("uppf_recovery"),
+            resolved_exdepot(cfg, product))
 
 
 def priced_frame(df, product, cfg, start, end):
@@ -1490,7 +1603,9 @@ def compute_window_pricing(df, product, cfg, start, end):
             "avg_price": float(px.mean()) if len(px) else np.nan,
             "min_price": float(px.min()) if len(px) else np.nan,
             "max_price": float(px.max()) if len(px) else np.nan,
-            "floor": dated_rate(floors, ws),
+            "floor": float(np.nanmean([dated_rate(floors, d)
+                                       for d in g["date"].unique()]))
+                     if floors else np.nan,
             "exdepot": dated_rate(exd_tbl, ws),
             "volume": float(g["volume"].sum()),
             "stations": int(g["station"].nunique()),
@@ -1529,6 +1644,139 @@ def compute_floor_breaches(df, product, cfg, start, end, tol=0.005):
     b["exposure"] = b["shortfall"] * b["volume"].fillna(0)
     return (b[["date", "station", "price", "floor", "shortfall", "volume", "exposure"]]
             .sort_values(["date", "station"]).reset_index(drop=True))
+
+
+# ───────────────────── NPA price-floor fetcher (best effort) ───────────────
+# The NPA publishes the minimum ex-pump price floor for each pricing window at
+# npa.gov.gh/price-floor. There is no API, no published schema and no guarantee
+# the page keeps its current shape, so this is written to fail loudly and hand
+# over to manual entry rather than to guess. NOTHING it finds is written to the
+# config automatically — it is staged for a human to confirm, because a wrong
+# floor silently turns the compliance report into fiction.
+NPA_FLOOR_URL = os.getenv("NPA_FLOOR_URL", "https://npa.gov.gh/price-floor/")
+NPA_UA = ("Mozilla/5.0 (compatible; OMC-Analytics/1.0; internal pricing compliance)")
+
+# Order matters: "Marine Gas Oil" must be claimed before the "gas oil" in AGO.
+NPA_PRODUCTS = [
+    ("MGO",  r"\bm\.?g\.?o\b|marine\s+gas"),
+    ("LPG",  r"\blpg\b|liquefied"),
+    ("KERO", r"\bkerosene\b|\bdpk\b|\bkero\b"),
+    ("PMS",  r"\bpms\b|petrol|gasoline|\bsuper\b|premium\s+motor"),
+    ("AGO",  r"\bago\b|diesel|gas\s*oil|automotive"),
+]
+NPA_NUM = r"\d{1,3}(?:,\d{3})*\.\d{1,4}"
+
+
+def _npa_product(label):
+    t = str(label).lower()
+    for code, pat in NPA_PRODUCTS:
+        if re.search(pat, t):
+            return code
+    return None
+
+
+def _strip_html(payload):
+    t = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", payload)
+    t = re.sub(r"(?s)<[^>]+>", " ", t)
+    t = (t.replace("&nbsp;", " ").replace("&amp;", "&")
+          .replace("&#8211;", "-").replace("&ndash;", "-").replace("&#162;", "\u00a2"))
+    return re.sub(r"[ \t\r\f\v]+", " ", t)
+
+
+def npa_window_dates(payload):
+    """Pull the effective date range out of the notice. Windows are nominally
+    1-15 and 16-month end, but the published start slips (August 2026 ran from
+    the 4th), so the printed dates are worth more than the convention."""
+    t = _strip_html(payload)
+    mons = ("january february march april may june july august september "
+            "october november december").split()
+    pat_mon = "|".join(mons)
+    m = re.search(rf"(\d{{1,2}})\s*(?:-|\u2013|to)\s*(\d{{1,2}})\s+({pat_mon})\w*\s+(\d{{4}})",
+                  t, re.I)
+    if m:
+        d1, d2, mon, yr = m.groups()
+        i = mons.index(mon.lower()[:3] and
+                       next(x for x in mons if x.startswith(mon.lower()[:3]))) + 1
+        return (pd.Timestamp(int(yr), i, int(d1)), pd.Timestamp(int(yr), i, int(d2)))
+    m = re.search(rf"({pat_mon})\w*\s+(\d{{1,2}})\s*(?:-|\u2013|to)\s*(?:(?:{pat_mon})\w*\s+)?"
+                  rf"(\d{{1,2}}),?\s*(\d{{4}})?", t, re.I)
+    if m:
+        mon, d1, d2, yr = m.groups()
+        i = mons.index(next(x for x in mons if x.startswith(mon.lower()[:3]))) + 1
+        yr = int(yr) if yr else date.today().year
+        return (pd.Timestamp(yr, i, int(d1)), pd.Timestamp(yr, i, int(d2)))
+    return (None, None)
+
+
+def parse_npa_floors(payload):
+    """Read floors out of HTML or out of text pasted straight from the notice.
+    Tries real tables first, then falls back to reading the sentences."""
+    rows = []
+    try:
+        tables = pd.read_html(io.StringIO(payload))
+    except Exception:
+        tables = []
+    for t in tables:
+        try:
+            t = t.astype(str)
+        except Exception:
+            continue
+        for _, r in t.iterrows():
+            cells = [str(x) for x in r.values]
+            code = next((c for c in (_npa_product(x) for x in cells) if c), None)
+            if not code:
+                continue
+            nums = []
+            for x in cells:
+                nums += re.findall(NPA_NUM, x)
+            nums = [float(n.replace(",", "")) for n in nums]
+            nums = [n for n in nums if 0.5 < n < 500]
+            if nums:
+                rows.append({"product": code, "price": nums[0],
+                             "unit": "GHS/kg" if code == "LPG" else "GHS/L",
+                             "source": "table", "raw": " | ".join(cells)[:160]})
+    if not rows:
+        text = _strip_html(payload)
+        for code, pat in NPA_PRODUCTS:
+            m = re.search(rf"(?:{pat})[^.;\n]{{0,160}}?(?:GH[\u00a2\u20b5cC]|GHS|GHC)?\s*({NPA_NUM})",
+                          text, re.I)
+            if not m:
+                continue
+            val = float(m.group(1).replace(",", ""))
+            if not (0.5 < val < 500):
+                continue
+            rows.append({"product": code, "price": val,
+                         "unit": "GHS/kg" if code == "LPG" else "GHS/L",
+                         "source": "text", "raw": m.group(0).strip()[:160]})
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return (out.drop_duplicates(subset=["product"], keep="first")
+               .sort_values("product").reset_index(drop=True))
+
+
+def fetch_npa_floors(url=None, timeout=30):
+    """Returns (frame, (start, end), note). Never raises — the caller shows the
+    note and falls through to pasting or typing the figures."""
+    url = url or NPA_FLOOR_URL
+    try:
+        import requests
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": NPA_UA,
+                                                        "Accept": "text/html"})
+        r.raise_for_status()
+    except Exception as e:
+        return pd.DataFrame(), (None, None), f"Couldn't reach {url} — {e}"
+    body = r.text
+    frame = parse_npa_floors(body)
+    lo, hi = npa_window_dates(body)
+    if frame.empty:
+        note = ("Reached the page but found no floor figures in it. That usually means the "
+                "table is rendered by JavaScript after load, which a plain fetch can't see. "
+                "Copy the notice text from the page and paste it below — the same parser "
+                "reads pasted text.")
+    else:
+        note = f"Read {len(frame)} product(s) from the page."
+    return frame, (lo, hi), note
 
 
 def price_dispersion(df, product, as_of=None):
@@ -3061,8 +3309,33 @@ def main():
         _acc(acc)
         _hero("⚙️", "Settings",
               "the commercial numbers behind every money figure in this system", badge="CONFIG")
-        st.caption(f"Stored in `{CONFIG_PATH}`. Nothing here is guessed — enter your own "
-                   "figures from the current pricing window and the invoices you actually pay.")
+        if CONFIG_LOAD.get("source") == "file":
+            st.success(f"Loaded from `{CONFIG_LOAD['path']}`")
+        elif CONFIG_LOAD.get("source") == "secrets":
+            st.success("Loaded from Streamlit secrets (`omc_config`)")
+        else:
+            st.error("**No config file was found — you are looking at empty defaults.** "
+                     + (CONFIG_LOAD.get("error") or ""))
+            with st.expander("Paths I looked in"):
+                st.code("\n".join(CONFIG_LOAD.get("tried") or ["(none)"]))
+                st.markdown(
+                    "<span class='note'>Deployed on Streamlit Community Cloud? The file has to be "
+                    "<b>committed to the repo</b> — uploading it to a running app does nothing, and "
+                    "the container is rebuilt from git on every reboot. Put "
+                    "<code>omc_config.json</code> beside this script in the repository, or paste its "
+                    "contents into <b>Settings &rarr; Secrets</b> as "
+                    "<code>omc_config = &#39;&#39;&#39;{ ... }&#39;&#39;&#39;</code>.</span>",
+                    unsafe_allow_html=True)
+        c1, c2 = st.columns([1, 3])
+        if c1.button("↻ Reload from disk", use_container_width=True, key="cfgreload"):
+            st.session_state["omc_cfg"] = load_config()
+            st.rerun()
+        c2.caption("Nothing here is guessed — enter your own figures from the current pricing "
+                   "window and the invoices you actually pay.")
+        if config_is_ephemeral():
+            st.warning("This looks like a hosted deployment with no persistent disk. **Saving "
+                       "writes a file that will vanish on the next reboot.** Edit here, then use "
+                       "*Download config* below and commit that file to your repo.")
 
         etabs = st.tabs(["Commercial model", "Price floors", "Sites", "Logistics & control",
                          "Company", "Raw JSON"])
@@ -3085,28 +3358,116 @@ def main():
                     f"{rp} UPPF recovery (GHS/L)", value=float(ec.get("uppf_recovery") or 0),
                     step=0.01, format="%.4f", key=f"up_{rp}",
                     help="Leave at zero unless you actually claim and receive it.")
-                st.markdown(f"<span class='note'>{rp} ex-depot cost — what the BDC invoices you "
-                            "per litre. Add a row each time it changes; the date is the day it "
-                            "took effect.</span>", unsafe_allow_html=True)
-                cur = rate_table_frame(ec.get("exdepot", {}))
-                if cur.empty:
-                    cur = pd.DataFrame({"effective_from": pd.Series(dtype="datetime64[ns]"),
-                                        "value": pd.Series(dtype=float)})
-                ed = st.data_editor(cur, num_rows="dynamic", use_container_width=True,
-                                    key=f"exd_{rp}",
-                                    column_config={
-                                        "effective_from": st.column_config.DateColumn("Effective from"),
-                                        "value": st.column_config.NumberColumn(
-                                            "Ex-depot GHS/L", format="%.4f")})
-                ec["exdepot"] = {pd.Timestamp(r["effective_from"]).strftime("%Y-%m-%d"): float(r["value"])
-                                 for _, r in ed.iterrows()
-                                 if pd.notna(r.get("effective_from")) and pd.notna(r.get("value"))}
+                st.markdown(
+                    f"<span class='note'>{rp} ex-depot cost is built from two tables: the "
+                    "<b>base price</b> the BDC charges per litre, and the <b>duties and levies</b> "
+                    "riding on it. They are kept apart because the base moves with every lifting "
+                    "while the tax moves when policy moves — so a levy change is one row, not "
+                    "hundreds.</span>", unsafe_allow_html=True)
+                ec1, ec2 = st.columns(2)
+                for col, key, label in ((ec1, "exdepot_base", f"{rp} base GHS/L"),
+                                        (ec2, "tax", f"{rp} duties + levies GHS/L")):
+                    with col:
+                        cur = rate_table_frame(ec.get(key, {}))
+                        if cur.empty:
+                            cur = pd.DataFrame({"effective_from": pd.Series(dtype="datetime64[ns]"),
+                                                "value": pd.Series(dtype=float)})
+                        ed = st.data_editor(
+                            cur, num_rows="dynamic", use_container_width=True,
+                            key=f"{key}_{rp}", height=250,
+                            column_config={
+                                "effective_from": st.column_config.DateColumn("Effective from"),
+                                "value": st.column_config.NumberColumn(label, format="%.4f")})
+                        ec[key] = {pd.Timestamp(r["effective_from"]).strftime("%Y-%m-%d"):
+                                   float(r["value"]) for _, r in ed.iterrows()
+                                   if pd.notna(r.get("effective_from")) and pd.notna(r.get("value"))}
+                res = resolved_exdepot(cfg, rp)
+                if res:
+                    rf = rate_table_frame(res).tail(6)
+                    st.markdown(f"<span class='note'>Resolved {rp} ex-depot — base plus tax, most "
+                                "recent entries:</span>", unsafe_allow_html=True)
+                    st.dataframe(rf.assign(
+                        effective_from=rf["effective_from"].dt.strftime("%d %b %Y")).rename(
+                        columns={"effective_from": "From", "value": "Ex-depot GHS/L"})
+                        .style.format({"Ex-depot GHS/L": "{:,.4f}"}),
+                        use_container_width=True, hide_index=True)
 
         with etabs[1]:
             st.markdown("<div class='eyebrow'>NPA minimum pump price by window</div>",
                         unsafe_allow_html=True)
-            st.markdown("<span class='note'>Enter the floor published for each pricing window. "
-                        "Use the window start date — 1st or 16th.</span>", unsafe_allow_html=True)
+            st.markdown("<span class='note'>Enter the floor published for each pricing window, "
+                        "dated from the day it takes effect. Published start dates slip — the "
+                        "first August 2026 window ran from the 4th, not the 1st — so use the "
+                        "date on the notice, not the convention.</span>", unsafe_allow_html=True)
+
+            # ---- pull from the NPA site, review, then apply ----
+            with st.expander("🌐 Pull from npa.gov.gh/price-floor", expanded=False):
+                st.markdown(
+                    "<span class='note'>The NPA publishes floors as a web page, not an API. "
+                    "This tries to read it; if the page blocks the request or builds its table "
+                    "in the browser, paste the notice text instead — the same parser reads it. "
+                    "Nothing is written to your config until you press Apply.</span>",
+                    unsafe_allow_html=True)
+                fc1, fc2 = st.columns([1, 2])
+                if fc1.button("🌐 Fetch now", use_container_width=True, key="npafetch"):
+                    with st.spinner("Reading npa.gov.gh…"):
+                        fr, (flo, fhi), note = fetch_npa_floors()
+                    st.session_state["npa_stage"] = fr
+                    st.session_state["npa_dates"] = (flo, fhi)
+                    st.session_state["npa_note"] = note
+                fc2.caption(f"Source: {NPA_FLOOR_URL} — override with the NPA_FLOOR_URL "
+                            "environment variable if the address changes.")
+
+                pasted = st.text_area(
+                    "…or paste the notice text / page source here",
+                    height=130, key="npapaste",
+                    placeholder="Under the revised price floors, petrol will be sold at a "
+                                "minimum of GH¢14.53 per litre, while diesel is pegged at "
+                                "GH¢14.97 per litre…")
+                if st.button("Read pasted text", key="npaparse") and pasted.strip():
+                    fr = parse_npa_floors(pasted)
+                    st.session_state["npa_stage"] = fr
+                    st.session_state["npa_dates"] = npa_window_dates(pasted)
+                    st.session_state["npa_note"] = (f"Read {len(fr)} product(s) from the pasted "
+                                                    "text." if not fr.empty else
+                                                    "Couldn't find any product and price in that "
+                                                    "text. Type the two figures in below instead.")
+
+                if st.session_state.get("npa_note"):
+                    st.info(st.session_state["npa_note"])
+                stage = st.session_state.get("npa_stage")
+                if stage is not None and not stage.empty:
+                    flo, fhi = st.session_state.get("npa_dates", (None, None))
+                    eff = st.date_input(
+                        "Effective from", value=(flo.date() if flo is not None else date.today()),
+                        key="npaeff",
+                        help="The day these floors take effect. Everything from this date until "
+                             "the next entry is checked against them.")
+                    if fhi is not None:
+                        st.caption(f"Notice reads as running to {fhi:%d %b %Y}.")
+                    st.dataframe(stage.rename(columns={
+                        "product": "Product", "price": "Floor", "unit": "Unit",
+                        "source": "Read from", "raw": "Matched text"}),
+                        use_container_width=True, hide_index=True)
+                    usable = stage[stage["product"].isin(["PMS", "AGO"])]
+                    if usable.empty:
+                        st.warning("Nothing here maps to PMS or AGO, which are the only two "
+                                   "grades this system prices.")
+                    elif st.button("✓ Apply these floors", key="npaapply",
+                                   use_container_width=False):
+                        key = pd.Timestamp(eff).strftime("%Y-%m-%d")
+                        for _, r in usable.iterrows():
+                            cfg.setdefault("floors", {}).setdefault(
+                                r["product"], {})[key] = float(r["price"])
+                        st.success(f"Staged {len(usable)} floor(s) effective {key}. "
+                                   "Check the table below, then press Save settings.")
+                        st.session_state["npa_stage"] = None
+                        st.rerun()
+                    st.caption("Read the matched text before applying. A floor that is wrong by "
+                               "ten pesewas turns the compliance report into fiction, and this "
+                               "parser is reading a page that was never designed to be read by "
+                               "a machine.")
+
             for rp in ("PMS", "AGO"):
                 phead(rp)
                 cur = rate_table_frame((cfg.get("floors") or {}).get(rp, {}))
@@ -3218,7 +3579,10 @@ def main():
             st.code(json.dumps(cfg, indent=2, sort_keys=True), language="json")
 
         st.divider()
-        c1, c2 = st.columns([1, 3])
+        c1, cD, c2 = st.columns([1, 1, 2])
+        cD.download_button("⬇️ Download config", config_bytes(cfg),
+                           file_name="omc_config.json", mime="application/json",
+                           use_container_width=True, key="cfgdl")
         if c1.button("💾 Save settings", use_container_width=True, key="savecfg"):
             try:
                 p = save_config(cfg)
