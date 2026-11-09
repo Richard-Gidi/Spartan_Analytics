@@ -1465,6 +1465,75 @@ def window_index(dmin, dmax):
 
 
 # ───────────────────────────── margin engine ───────────────────────────────
+# ─────────────────── ex-depot cost from the BDC sales book ─────────────────
+# Spartan lifts at the price the BDC charges JD-LINK, and that price is
+# already levy-inclusive: on every PMS day in the book it sits under the NPA
+# ex-pump floor by about an OMC-plus-dealer margin, and stacking the duties
+# table on top pushed it over the floor on 93% of days. So the book price IS
+# the ex-depot cost, and nothing is added to it.
+SALES_BOOK_OMC = os.getenv("SALES_BOOK_OMC", "JD-LINK")
+
+
+def _omc_key(x):
+    return re.sub(r"[^A-Z0-9]", "", str(x).upper())
+
+
+def exdepot_from_sales_book(src, omc=SALES_BOOK_OMC, sheet="Sales"):
+    """Read the BDC's sales workbook and return the daily ex-depot cost for
+    one customer, as {product: {"YYYY-MM-DD": GHS/L}} step tables plus a
+    per-day audit frame.
+
+    - Days with several liftings at different prices (from Sep 2026 the BDC
+      prices by depot) take the litre-weighted average — that is what the
+      litres actually cost.
+    - Loadings marked paid-but-not-loaded are left out: no product moved.
+    - Only days where the price changed are kept, because the app's lookup
+      carries the last price forward until the next one.
+    """
+    raw = pd.read_excel(src, sheet_name=sheet, header=None)
+    hdr = None
+    for i in range(min(len(raw), 40)):
+        vals = {str(v).strip().upper() for v in raw.iloc[i].values}
+        if {"DATE", "OMC", "PRODUCT", "QUANTITY", "PRICE"} <= vals:
+            hdr = i
+            break
+    if hdr is None:
+        raise ValueError(f"No header row with Date / OMC / Product / Quantity / Price "
+                         f"on sheet '{sheet}'.")
+    cols = [str(c).strip() for c in raw.iloc[hdr]]
+    s = raw.iloc[hdr + 1:].copy()
+    s.columns = cols
+    s = s.loc[:, ~pd.Index(cols).duplicated()]
+    s["Date"] = pd.to_datetime(s["Date"], errors="coerce")
+    s["Price"] = pd.to_numeric(s["Price"], errors="coerce")
+    s["Quantity"] = pd.to_numeric(s["Quantity"], errors="coerce")
+    s = s.dropna(subset=["Date", "Price", "Quantity"])
+    s = s[(s["Date"] >= "2000-01-01") & (s["Quantity"] > 0) & (s["Price"] > 0)]
+    s = s[s["OMC"].map(_omc_key).str.startswith(_omc_key(omc))]
+    if "Status" in s.columns:
+        s = s[~s["Status"].astype(str).str.lower().str.contains("haven")]
+    s["Product"] = s["Product"].astype(str).str.strip().str.upper()
+    tables, audit = {}, []
+    for g in ("PMS", "AGO"):
+        x = s[s["Product"] == g]
+        if x.empty:
+            continue
+        daily = (x.assign(v=x["Price"] * x["Quantity"]).groupby("Date")
+                  .agg(v=("v", "sum"), litres=("Quantity", "sum"), lo=("Price", "min"),
+                       hi=("Price", "max"), loads=("Price", "size")))
+        daily["price"] = (daily["v"] / daily["litres"]).round(4)
+        steps, last = {}, None
+        for d, r in daily.iterrows():
+            if last is None or abs(r["price"] - last) >= 1e-4:
+                steps[d.strftime("%Y-%m-%d")] = float(r["price"])
+                last = r["price"]
+        tables[g] = steps
+        audit.append(daily.reset_index().assign(product=g)[
+            ["product", "Date", "price", "lo", "hi", "loads", "litres"]])
+    aud = pd.concat(audit, ignore_index=True) if audit else pd.DataFrame()
+    return tables, aud
+
+
 def resolved_exdepot(cfg, product):
     """Ex-depot cost per litre = what the BDC charges, plus the duties and levies
     that ride on it. Keeping the two apart matters: the base price moves with
@@ -2075,6 +2144,1066 @@ def site_scorecard(df, cfg, station, start, end):
             "control": ctl,
         }
     return card
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#                  YEAR-END REVIEW — analytics engine
+# ═══════════════════════════════════════════════════════════════════════════
+# The review always runs 1 January → the last FULL month, and every prior year
+# is cut to exactly the same calendar months. Comparing ten months of this year
+# with twelve of last year is the oldest mistake in annual reporting, and it
+# flatters nobody honestly.
+MONTHS3 = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+GRADES = ("PMS", "AGO")
+YEAR_GREYS = ["#4E5661", "#8A929C", "#B7BEC6", "#D6DBE0"]
+YOY_DOWN, YOY_UP = "#B00020", "#1F9D57"
+
+
+def last_full_month(dmax, today=None):
+    """The latest calendar month that has fully ended — on the calendar AND in
+    the sheet. A month the stations haven't finished reporting is not full."""
+    today = pd.Timestamp(today if today is not None else date.today()).normalize()
+    anchor = min(pd.Timestamp(dmax).normalize(), today)
+    if anchor == (anchor + pd.offsets.MonthEnd(0)).normalize():
+        return anchor.year, anchor.month
+    prev = anchor.replace(day=1) - pd.Timedelta(days=1)
+    return prev.year, prev.month
+
+
+def ytd_window(year, month):
+    s = pd.Timestamp(year=int(year), month=1, day=1)
+    e = (pd.Timestamp(year=int(year), month=int(month), day=1)
+         + pd.offsets.MonthEnd(0)).normalize()
+    return s, e
+
+
+def period_label(year, month):
+    if int(month) == 12:
+        return f"Full year {year}"
+    if int(month) == 1:
+        return f"Jan {year}"
+    return f"Jan–{MONTHS3[int(month) - 1]} {year}"
+
+
+def _real(df):
+    return df[df["product"].isin(GRADES)]
+
+
+def data_years(df):
+    v = _real(df).dropna(subset=["volume"])
+    return sorted(int(y) for y in v["date"].dt.year.unique())
+
+
+def _chg(a, b):
+    try:
+        a, b = float(a), float(b)
+    except (TypeError, ValueError):
+        return np.nan
+    return (a - b) / b * 100 if (b and np.isfinite(b) and np.isfinite(a)) else np.nan
+
+
+def _div(a, b):
+    try:
+        a, b = float(a), float(b)
+    except (TypeError, ValueError):
+        return np.nan
+    return a / b if (b and np.isfinite(b) and np.isfinite(a)) else np.nan
+
+
+# ───────────────────────────── period statistics ───────────────────────────
+ADDITIVE = ["volume", "site_days", "vol_priced", "revenue", "vol_costed", "cogs",
+            "gross", "net", "loss_l", "loss_value", "discharged", "shortage", "drops",
+            "floor_days", "floor_exposure", "floor_checked_days"]
+
+
+def _grade_stats(df, cfg, product, s, e, cap=DELIVERY_CAP):
+    sl = _slice(df, product, s, e).dropna(subset=["volume"])
+    selling = sl[sl["volume"] > 0]
+    out = {"volume": float(sl["volume"].sum()), "site_days": int(len(sl)),
+           "stations": set(selling["station"].unique()),
+           "months": int(selling["date"].dt.month.nunique())}
+
+    pf = priced_frame(df, product, cfg, s, e)
+    if pf.empty:
+        out.update(vol_priced=0.0, revenue=0.0, vol_costed=0.0, cogs=0.0,
+                   gross=0.0, net=0.0)
+    else:
+        pr = pf[pf["price"].notna()]
+        co = pf[pf["exdepot"].notna() & pf["price"].notna()]
+        out.update(vol_priced=float(pr["volume"].sum()), revenue=float(pr["revenue"].sum()),
+                   vol_costed=float(co["volume"].sum()), cogs=float(co["cogs"].sum()),
+                   gross=float(co["gross"].sum()), net=float(co["net"].sum()))
+
+    vv = compute_variance(df, product, pd.DataFrame(), s, e, STANDARD[product], cap)
+    dv = vv["dip_variance"].dropna() if not vv.empty else pd.Series(dtype=float)
+    out["loss_l"] = float((-dv.clip(upper=0)).sum())
+    unit = _div(out["cogs"], out["vol_costed"])
+    out["loss_value"] = out["loss_l"] * unit if np.isfinite(unit) else 0.0
+
+    dp = compute_delivery_perf(df, product, s, e)
+    out["discharged"] = float(dp["discharged"].sum()) if not dp.empty else 0.0
+    out["shortage"] = float(dp["shortage"].sum()) if not dp.empty else 0.0
+    out["drops"] = int(dp["drops"].sum()) if not dp.empty else 0
+
+    floors = (cfg.get("floors") or {}).get(product, {})
+    if floors:
+        br = compute_floor_breaches(df, product, cfg, s, e)
+        out["floor_days"] = int(len(br))
+        out["floor_exposure"] = float(br["exposure"].sum()) if not br.empty else 0.0
+        out["floor_checked_days"] = int(sl["price"].notna().sum())
+    else:
+        out.update(floor_days=0, floor_exposure=0.0, floor_checked_days=0)
+    return out
+
+
+def _derive(r):
+    r["rate_per_site_day"] = _div(r["volume"], r["site_days"])
+    r["avg_price"] = _div(r["revenue"], r["vol_priced"])
+    r["avg_cost"] = _div(r["cogs"], r["vol_costed"])
+    r["cost_cov"] = _div(r["vol_costed"], r["volume"]) * 100
+    r["gross_pl"] = _div(r["gross"], r["vol_costed"])
+    r["contribution"] = (r["net"] - r["loss_value"]) if r["vol_costed"] else np.nan
+    r["contrib_pl"] = _div(r["contribution"], r["vol_costed"])
+    r["loss_pct"] = _div(r["loss_l"], r["volume"]) * 100
+    r["transit_pct"] = _div(r["shortage"], r["discharged"]) * 100
+    if not r["vol_costed"]:
+        for k in ("gross", "net", "cogs", "loss_value"):
+            r[k] = np.nan
+    return r
+
+
+def _return_rate(df, s, e):
+    """Returns received ÷ days each site was trading (first to last return in
+    the window). A site that closed in February isn't 'missing' March to
+    October — that shows up as a lost site in the station league instead."""
+    p = df[(df["product"] == "PMS") & (df["date"] >= s) & (df["date"] <= e)]
+    p = p.dropna(subset=["volume"])
+    if p.empty:
+        return np.nan
+    g = p.groupby("station")["date"].agg(["min", "max", "nunique"])
+    span = ((g["max"] - g["min"]).dt.days + 1).sum()
+    return _div(g["nunique"].sum(), span) * 100
+
+
+def yearend_year_table(df, cfg, years, month):
+    """One row per year × (PMS, AGO, ALL) covering Jan→month of that year."""
+    rows = []
+    for y in years:
+        s, e = ytd_window(y, month)
+        per = {}
+        for g in GRADES:
+            st_ = _grade_stats(df, cfg, g, s, e)
+            per[g] = st_
+            r = {k: v for k, v in st_.items() if k != "stations"}
+            r.update(year=y, product=g, stations=len(st_["stations"]))
+            rows.append(_derive(r))
+        tot = {k: sum((per[g].get(k) or 0) for g in GRADES) for k in ADDITIVE}
+        tot.update(year=y, product="ALL",
+                   stations=len(per["PMS"]["stations"] | per["AGO"]["stations"]),
+                   months=max(per["PMS"]["months"], per["AGO"]["months"]))
+        tot = _derive(tot)
+        tot["avg_price"] = np.nan          # a petrol+diesel average price means nothing
+        tot["return_rate"] = _return_rate(df, s, e)
+        bk = banking_frame(df, s, e)
+        if has_value(bk):
+            tot["cash"] = float(bk["sales_value"].sum())
+            tot["deposited"] = float(bk["deposited"].sum())
+            tot["banked_pct"] = _div(tot["deposited"], tot["cash"]) * 100
+        rows.append(tot)
+    out = pd.DataFrame(rows)
+    for c in ("return_rate", "cash", "deposited", "banked_pct"):
+        if c not in out.columns:
+            out[c] = np.nan
+    return out
+
+
+# ──────────────────────────── station like-for-like ────────────────────────
+def station_yoy(df, year, cmp_year, month, product="ALL"):
+    """Station league for the YTD window against the same months of cmp_year.
+
+    A station counts as like-for-like only if it reported on at least 60% of
+    the days in BOTH windows; otherwise it is new, lost or partial, and its litres
+    are kept out of the like-for-like growth rate. Without this split a network
+    that opened three sites looks like it's growing when the old sites are
+    actually shrinking."""
+    s, e = ytd_window(year, month)
+    prods = GRADES if product == "ALL" else (product,)
+    base = _real(df)
+    base = base[base["product"].isin(prods)].dropna(subset=["volume"])
+
+    def agg(a, b):
+        w = base[(base["date"] >= a) & (base["date"] <= b)]
+        return w.groupby("station").agg(volume=("volume", "sum"), days=("date", "nunique"))
+
+    cur = agg(s, e).add_suffix("_cur")
+    if cmp_year is not None:
+        ps, pe = ytd_window(cmp_year, month)
+        prev = agg(ps, pe).add_suffix("_prev")
+    else:
+        prev = pd.DataFrame(columns=["volume_prev", "days_prev"])
+    t = pd.concat([cur, prev], axis=1).fillna(0.0)
+    if t.empty:
+        return t
+    t.index.name = "station"
+    t = t.reset_index()
+    win = (e - s).days + 1
+    min_days = max(7, int(0.6 * win))
+
+    def status(r):
+        if r["days_cur"] >= min_days and r["days_prev"] >= min_days:
+            return "like-for-like"
+        if r["days_prev"] == 0 and r["days_cur"] > 0:
+            return "new"
+        if r["days_cur"] == 0 and r["days_prev"] > 0:
+            return "lost"
+        return "partial"
+
+    t["status"] = t.apply(status, axis=1)
+    t["change"] = t["volume_cur"] - t["volume_prev"]
+    t["growth_pct"] = [_chg(a, b) if b > 0 else np.nan
+                       for a, b in zip(t["volume_cur"], t["volume_prev"])]
+    t["rate_cur"] = [_div(v, d) for v, d in zip(t["volume_cur"], t["days_cur"])]
+    t["rate_prev"] = [_div(v, d) for v, d in zip(t["volume_prev"], t["days_prev"])]
+    t["rate_growth_pct"] = [_chg(a, b) for a, b in zip(t["rate_cur"], t["rate_prev"])]
+    tc, tp = t["volume_cur"].sum(), t["volume_prev"].sum()
+    t["share_cur"] = t["volume_cur"] / tc * 100 if tc else np.nan
+    t["share_prev"] = t["volume_prev"] / tp * 100 if tp else np.nan
+    t["rank_cur"] = t["volume_cur"].where(t["volume_cur"] > 0).rank(ascending=False, method="min")
+    t["rank_prev"] = t["volume_prev"].where(t["volume_prev"] > 0).rank(ascending=False, method="min")
+    t["rank_move"] = t["rank_prev"] - t["rank_cur"]
+    return t.sort_values("volume_cur", ascending=False).reset_index(drop=True)
+
+
+def volume_bridge(sy):
+    """Prior YTD → like-for-like change → new sites → lost sites → partial → current."""
+    if sy is None or sy.empty:
+        return {}
+    prev, cur = float(sy["volume_prev"].sum()), float(sy["volume_cur"].sum())
+    lfl = sy[sy["status"] == "like-for-like"]
+    part = sy[sy["status"] == "partial"]
+    out = {"prev": prev, "cur": cur,
+           "lfl": float((lfl["volume_cur"] - lfl["volume_prev"]).sum()),
+           "new": float(sy.loc[sy["status"] == "new", "volume_cur"].sum()),
+           "lost": -float(sy.loc[sy["status"] == "lost", "volume_prev"].sum()),
+           "partial": float((part["volume_cur"] - part["volume_prev"]).sum()),
+           "n_lfl": int(len(lfl)), "n_new": int((sy["status"] == "new").sum()),
+           "n_lost": int((sy["status"] == "lost").sum()),
+           "n_partial": int(len(part))}
+    out["lfl_growth"] = _chg(lfl["volume_cur"].sum(), lfl["volume_prev"].sum())
+    out["lfl_rate_growth"] = _chg(_div(lfl["volume_cur"].sum(), lfl["days_cur"].sum()),
+                                  _div(lfl["volume_prev"].sum(), lfl["days_prev"].sum()))
+    out["headline_growth"] = _chg(cur, prev)
+    return out
+
+
+def concentration(sy, n=3):
+    if sy is None or sy.empty:
+        return np.nan, np.nan
+    c = sy["share_cur"].sort_values(ascending=False).head(n).sum()
+    p = sy["share_prev"].sort_values(ascending=False).head(n).sum() \
+        if sy["volume_prev"].sum() else np.nan
+    return float(c), (float(p) if p == p else np.nan)
+
+
+# ──────────────────────────── monthly structure ────────────────────────────
+def monthly_volumes(df, years):
+    v = _real(df).dropna(subset=["volume"])
+    v = v[v["date"].dt.year.isin(list(years))]
+    if v.empty:
+        return pd.DataFrame(columns=["year", "month", "product", "volume", "site_days",
+                                     "stations"])
+    g = (v.assign(year=v["date"].dt.year, month=v["date"].dt.month)
+           .groupby(["year", "month", "product"])
+           .agg(volume=("volume", "sum"), site_days=("volume", "size"),
+                stations=("station", "nunique")).reset_index())
+    tot = (g.groupby(["year", "month"])
+             .agg(volume=("volume", "sum"), site_days=("site_days", "sum"),
+                  stations=("stations", "max")).reset_index().assign(product="ALL"))
+    return pd.concat([g, tot], ignore_index=True)
+
+
+def month_matrix(mv, product, years, year, month):
+    """Months down, years across. The report year stops at the last full month."""
+    sub = mv[mv["product"] == product]
+    m = sub.pivot_table(index="month", columns="year", values="volume", aggfunc="sum")
+    m = m.reindex(index=range(1, 13), columns=list(years))
+    if year in m.columns:
+        m.loc[m.index > month, year] = np.nan
+    return m
+
+
+def cumulative_curves(df, years, month, product="ALL"):
+    prods = GRADES if product == "ALL" else (product,)
+    base = _real(df)
+    base = base[base["product"].isin(prods)].dropna(subset=["volume"])
+    out = []
+    for y in years:
+        s, e = ytd_window(y, month)
+        d = base[(base["date"] >= s) & (base["date"] <= e)].groupby("date")["volume"].sum()
+        if d.empty:
+            continue
+        d = d.reindex(pd.date_range(s, e, freq="D"), fill_value=0.0).cumsum()
+        out.append(pd.DataFrame({"year": y, "date": d.index,
+                                 "axis": [pd.Timestamp(2000, x.month, x.day) for x in d.index],
+                                 "cum": d.values}))
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
+
+
+def monthly_price_margin(df, cfg, product, years):
+    floors = (cfg.get("floors") or {}).get(product, {})
+    rows = []
+    for y in years:
+        pf = priced_frame(df, product, cfg, pd.Timestamp(y, 1, 1), pd.Timestamp(y, 12, 31))
+        if pf.empty:
+            continue
+        pf = pf.assign(month=pf["date"].dt.month)
+        for m, g in pf.groupby("month"):
+            vp = g[g["price"].notna()]
+            vc = g[g["price"].notna() & g["exdepot"].notna()]
+            rows.append({
+                "year": y, "month": m, "volume": float(g["volume"].sum()),
+                "price": _div(vp["revenue"].sum(), vp["volume"].sum()),
+                "exdepot": _div(vc["cogs"].sum(), vc["volume"].sum()),
+                "gross_pl": _div(vc["gross"].sum(), vc["volume"].sum()),
+                "floor": (float(np.nanmean([dated_rate(floors, d)
+                                            for d in g["date"].unique()]))
+                          if floors else np.nan)})
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["headroom"] = out["price"] - out["floor"]
+    return out
+
+
+def quarter_table(mv, product, years, year, month):
+    sub = mv[mv["product"] == product].copy()
+    sub = sub[~((sub["year"] == year) & (sub["month"] > month))]
+    sub["quarter"] = (sub["month"] - 1) // 3 + 1
+    q = sub.pivot_table(index="quarter", columns="year", values="volume", aggfunc="sum")
+    q = q.reindex(index=[1, 2, 3, 4], columns=list(years))
+    partial_q = (month - 1) // 3 + 1 if month % 3 else None
+    return q, partial_q
+
+
+def complete_years(mv, product="ALL"):
+    sub = mv[(mv["product"] == product) & (mv["volume"] > 0)]
+    n = sub.groupby("year")["month"].nunique()
+    return sorted(int(y) for y, k in n.items() if k == 12)
+
+
+def seasonal_index(mv, product="ALL"):
+    """Each month's share of a normal month, averaged over complete years."""
+    full = complete_years(mv, product)
+    sub = mv[(mv["product"] == product) & (mv["year"].isin(full))]
+    if sub.empty:
+        return pd.Series(dtype=float), full
+    idx = []
+    for y, g in sub.groupby("year"):
+        mean = g["volume"].mean()
+        idx.append(g.set_index("month")["volume"] / mean * 100)
+    return pd.concat(idx, axis=1).mean(axis=1).reindex(range(1, 13)), full
+
+
+def fy_projection(mv, year, month, product="ALL"):
+    """Full-year landing two ways. The seasonal method scales YTD by the share
+    of the year a complete reference year had sold by the same month — it knows
+    December is not a typical month. The run-rate method doesn't, and is shown
+    only so the two can be compared."""
+    sub = mv[mv["product"] == product]
+    ytd = float(sub[(sub["year"] == year) & (sub["month"] <= month)]["volume"].sum())
+    s, e = ytd_window(year, month)
+    days_in_year = 366 if pd.Timestamp(year, 12, 31).dayofyear == 366 else 365
+    out = {"ytd": ytd, "runrate": ytd / ((e - s).days + 1) * days_in_year,
+           "ref": None, "share": np.nan, "seasonal": np.nan, "outlook": pd.DataFrame(),
+           "prior_fy": np.nan}
+    full = [y for y in complete_years(mv, product) if y < year]
+    if (year - 1) in full:
+        out["prior_fy"] = float(sub[sub["year"] == year - 1]["volume"].sum())
+    if month >= 12:
+        out["seasonal"] = ytd
+        return out
+    if full:
+        ref = max(full)
+        r = sub[sub["year"] == ref].set_index("month")["volume"]
+        ref_ytd, ref_fy = float(r.loc[1:month].sum()), float(r.sum())
+        if ref_ytd > 0:
+            share = ref_ytd / ref_fy
+            scale = ytd / ref_ytd
+            out.update(ref=ref, share=share, seasonal=ytd / share)
+            out["outlook"] = pd.DataFrame({"month": list(range(month + 1, 13)),
+                                           "projected": [float(r.get(m, 0.0)) * scale
+                                                         for m in range(month + 1, 13)]})
+    return out
+
+
+def station_control_yoy(df, year, cmp_year, month, cap=DELIVERY_CAP):
+    def per(y):
+        if y is None:
+            return pd.DataFrame(columns=["station", "loss", "thru"])
+        s, e = ytd_window(y, month)
+        rows = []
+        for g in GRADES:
+            vv = compute_variance(df, g, pd.DataFrame(), s, e, STANDARD[g], cap)
+            for _, r in vv.iterrows():
+                dv = r["dip_variance"]
+                rows.append({"station": r["station"],
+                             "loss": max(-dv, 0.0) if dv == dv else 0.0,
+                             "thru": r["throughput"] or 0.0})
+        d = pd.DataFrame(rows)
+        return d.groupby("station", as_index=False).sum() if not d.empty else d
+    c, p = per(year), per(cmp_year)
+    m = c.merge(p, on="station", how="outer", suffixes=("_cur", "_prev")).fillna(0.0)
+    if m.empty:
+        return m
+    m["loss_pct_cur"] = [_div(a, b) * 100 for a, b in zip(m["loss_cur"], m["thru_cur"])]
+    m["loss_pct_prev"] = [_div(a, b) * 100 for a, b in zip(m["loss_prev"], m["thru_prev"])]
+    m["change_pp"] = m["loss_pct_cur"] - m["loss_pct_prev"]
+    m = m[(m["thru_cur"] > 0) | (m["thru_prev"] > 0)]
+    return m.sort_values("loss_pct_cur", ascending=False).reset_index(drop=True)
+
+
+# ────────────────────────────── the full pack ──────────────────────────────
+def yearend_pack(df, cfg, year, month, cmp_years, primary):
+    years = [int(year)] + sorted({int(y) for y in cmp_years if int(y) != int(year)},
+                                 reverse=True)
+    primary = int(primary) if primary is not None else None
+    mv = monthly_volumes(df, years)
+    yt = yearend_year_table(df, cfg, years, month)
+    pack = {"year": int(year), "month": int(month), "years": years, "primary": primary,
+            "label": period_label(year, month),
+            "cmp_label": period_label(primary, month) if primary else None,
+            "years_table": yt, "monthly": mv,
+            "station": {p: station_yoy(df, year, primary, month, p)
+                        for p in ("ALL",) + GRADES},
+            "price": {g: monthly_price_margin(df, cfg, g, years) for g in GRADES},
+            "control": station_control_yoy(df, year, primary, month),
+            "projection": {p: fy_projection(mv, year, month, p) for p in ("ALL",) + GRADES},
+            "seasonal": seasonal_index(mv, "ALL"),
+            "cumulative": cumulative_curves(df, years, month, "ALL")}
+    pack["bridge"] = volume_bridge(pack["station"]["ALL"]) if primary else {}
+    pack["findings"] = yearend_findings(pack)
+    return pack
+
+
+def _yrow(pack, y, p):
+    t = pack["years_table"]
+    r = t[(t["year"] == y) & (t["product"] == p)]
+    return r.iloc[0] if len(r) else None
+
+
+# ─────────────────────────────── the narrative ─────────────────────────────
+def _sgn(x, d=1, unit="%"):
+    return "—" if x is None or not np.isfinite(x) else f"{x:+.{d}f}{unit}"
+
+
+def yearend_findings(pack):
+    """Plain-language findings, ordered the way an analyst would brief a board:
+    the headline, whether it's real, what drove it, what it cost, what's next.
+    **double asterisks** mark emphasis; each output format renders them."""
+    y, p, lab, clab = pack["year"], pack["primary"], pack["label"], pack["cmp_label"]
+    F = []
+    A = _yrow(pack, y, "ALL")
+    if A is None or not A["volume"]:
+        return [f"No sales recorded for {lab}."]
+    B = _yrow(pack, p, "ALL") if p else None
+    have_b = B is not None and B["volume"] > 0
+    rP, rA = _yrow(pack, y, "PMS"), _yrow(pack, y, "AGO")
+
+    # 1 headline
+    if have_b:
+        bP, bA = _yrow(pack, p, "PMS"), _yrow(pack, p, "AGO")
+        F.append(f"{lab}: the network sold **{A['volume']:,.0f} L**, "
+                 f"**{_sgn(_chg(A['volume'], B['volume']))}** on {clab} "
+                 f"(PMS {_sgn(_chg(rP['volume'], bP['volume']))}, "
+                 f"AGO {_sgn(_chg(rA['volume'], bA['volume']))}).")
+    else:
+        F.append(f"{lab}: the network sold **{A['volume']:,.0f} L** "
+                 f"(PMS {rP['volume']:,.0f} L, AGO {rA['volume']:,.0f} L). "
+                 + (f"There is no recorded trading in {clab} to compare against."
+                    if p else "No comparison year selected."))
+
+    # 2 is the growth real?
+    br = pack.get("bridge") or {}
+    if have_b and br and br.get("n_lfl"):
+        hg, lg = br["headline_growth"], br["lfl_growth"]
+        line = (f"Like-for-like, the **{br['n_lfl']} sites** trading in both periods moved "
+                f"**{_sgn(lg)}**, or {_sgn(br['lfl_rate_growth'])} per reported trading day.")
+        bits = []
+        if br["new"]:
+            bits.append(f"new sites added {br['new']:,.0f} L")
+        if br["lost"]:
+            bits.append(f"sites that went quiet took away {-br['lost']:,.0f} L")
+        if br["partial"]:
+            bits.append(f"sites trading only part of either period moved {br['partial']:+,.0f} L")
+        if bits:
+            line += " Beyond them, " + "; ".join(bits) + "."
+        delta = br["cur"] - br["prev"]
+        if delta and np.isfinite(hg) and abs(hg) >= 1:
+            share = br["lfl"] / delta * 100
+            if share >= 0 and delta > 0:
+                line += (f" Existing forecourts delivered **{min(share, 999):.0f}%** of the extra "
+                         "litres" + (" — this growth is mostly real, not just a bigger network."
+                                     if share >= 60 else
+                                     " — most of the growth is the network getting bigger, not "
+                                     "the old sites selling more." if share < 40 else "."))
+            elif delta > 0 and share < 0:
+                line += (" The headline growth hides a decline at the existing sites — "
+                         "new sites are carrying the network.")
+            elif delta < 0 and br["lfl"] > 0:
+                line += " The existing sites actually grew; the fall is sites lost."
+        F.append(line)
+
+    # 3 mix
+    if have_b and A["volume"] and B["volume"]:
+        s_now = rA["volume"] / A["volume"] * 100
+        s_was = _yrow(pack, p, "AGO")["volume"] / B["volume"] * 100
+        if abs(s_now - s_was) >= 1:
+            F.append(f"Product mix shifted: AGO is now **{s_now:.0f}%** of litres "
+                     f"(was {s_was:.0f}%), a {s_now - s_was:+.1f} pp swing "
+                     + ("towards diesel." if s_now > s_was else "towards petrol."))
+
+    # 4 movers
+    sy = pack["station"]["ALL"]
+    if have_b and sy is not None and not sy.empty:
+        lfl = sy[(sy["status"] == "like-for-like")].dropna(subset=["rate_growth_pct"])
+        if len(lfl) >= 2:
+            top = lfl.loc[lfl["rate_growth_pct"].idxmax()]
+            bot = lfl.loc[lfl["rate_growth_pct"].idxmin()]
+            F.append(f"Strongest like-for-like site: **{top['station']}** "
+                     f"({_sgn(top['rate_growth_pct'])} per trading day, {top['change']:+,.0f} L). "
+                     f"Weakest: **{bot['station']}** ({_sgn(bot['rate_growth_pct'])} per "
+                     f"trading day, {bot['change']:+,.0f} L).")
+        c3, p3 = concentration(sy)
+        if np.isfinite(c3):
+            F.append(f"The top three sites carried **{c3:.0f}%** of litres"
+                     + (f" (was {p3:.0f}%)." if np.isfinite(p3) else ".")
+                     + (" That is concentration risk: one closure or one bad dealer "
+                        "moves the whole network." if c3 >= 55 else ""))
+
+    # 5 price and response
+    for g, r in (("PMS", rP), ("AGO", rA)):
+        if not have_b:
+            break
+        b = _yrow(pack, p, g)
+        dp = _chg(r["avg_price"], b["avg_price"])
+        dv = _chg(r["rate_per_site_day"], b["rate_per_site_day"])
+        if np.isfinite(dp) and abs(dp) >= 1:
+            e = dv / dp if np.isfinite(dv) else np.nan
+            txt = (f"{g} pump price averaged **GHS {r['avg_price']:,.2f}/L** against "
+                   f"{b['avg_price']:,.2f} ({_sgn(dp)}); litres per trading day moved "
+                   f"{_sgn(dv)}")
+            if np.isfinite(e):
+                txt += (f" — an implied response of {e:.2f}, indicative only: a full year "
+                        "of prices moves with everything else that changed.")
+            F.append(txt)
+
+    # 6 sharpest monthly price shock in the report year
+    for g in GRADES:
+        pm = pack["price"][g]
+        if pm.empty:
+            continue
+        c = pm[(pm["year"] == y) & (pm["month"] <= pack["month"])].sort_values("month")
+        if len(c) < 2:
+            continue
+        c = c.assign(dprice=c["price"].diff(), dvol=c["volume"].pct_change() * 100)
+        c = c.dropna(subset=["dprice"])
+        if c.empty:
+            continue
+        k = c.loc[c["dprice"].abs().idxmax()]
+        if abs(k["dprice"]) >= 0.5:
+            F.append(f"Sharpest {g} price move: **{k['dprice']:+.2f} GHS/L** into "
+                     f"{MONTHS3[int(k['month']) - 1]}, with month volume "
+                     f"{_sgn(k['dvol'])} on the month before.")
+
+    # 7 margin
+    if A["vol_costed"] and A["cost_cov"] >= 80:
+        line = f"Gross margin earned: **GHS {A['gross']:,.0f}** ({A['gross_pl']:,.3f}/L)"
+        if have_b and B["vol_costed"] and B["cost_cov"] >= 80:
+            line += (f", against GHS {B['gross']:,.0f} ({B['gross_pl']:,.3f}/L) — "
+                     f"{_sgn(_chg(A['gross'], B['gross']))} in cedis, "
+                     f"{A['gross_pl'] - B['gross_pl']:+.3f} GHS on every litre.")
+        else:
+            line += "."
+        if A["gross_pl"] < 0:
+            line += (" A negative gross margin means the cost on file sits above the pump "
+                     "price — check the ex-depot base isn't already levy-inclusive before "
+                     "the duties table is added on top.")
+        F.append(line)
+    elif A["vol_costed"]:
+        F.append(f"Ex-depot cost covers only {A['cost_cov']:.0f}% of {lab} litres, so "
+                 "margin figures are left out of the headline rather than understated.")
+
+    # 8 stock control
+    if A["loss_l"]:
+        line = (f"Stock losses: **{A['loss_l']:,.0f} L** ({A['loss_pct']:.2f}% of throughput"
+                + (f", ≈ GHS {A['loss_value']:,.0f} at cost)" if np.isfinite(A["loss_value"])
+                   else ")"))
+        if have_b and np.isfinite(B["loss_pct"]):
+            line += (f", versus {B['loss_pct']:.2f}% in {clab} — "
+                     + ("tighter." if A["loss_pct"] < B["loss_pct"] else "looser."))
+        else:
+            line += "."
+        F.append(line)
+    if A["discharged"]:
+        F.append(f"Transit shortage: {A['shortage']:,.0f} L on {A['discharged']:,.0f} L "
+                 f"discharged ({A['transit_pct']:.2f}%)"
+                 + (f", was {B['transit_pct']:.2f}%." if have_b and np.isfinite(B['transit_pct'])
+                    else ".") + " That is a carrier claim, not a station loss.")
+
+    # 9 compliance & discipline
+    if A["floor_checked_days"]:
+        F.append(f"Pricing compliance: **{int(A['floor_days'])}** site-day(s) sold below "
+                 f"the NPA floor"
+                 + (f" (exposure GHS {A['floor_exposure']:,.0f})" if A["floor_days"] else "")
+                 + (f"; {int(B['floor_days'])} in {clab}." if have_b and B["floor_checked_days"]
+                    else "."))
+    if np.isfinite(A.get("return_rate", np.nan)):
+        rr = A["return_rate"]
+        F.append(f"Daily returns came in on **{rr:.0f}%** of expected station-days"
+                 + (" — every comparison above is only as complete as that." if rr < 95
+                    else "."))
+
+    # 10 peak / trough
+    mv = pack["monthly"]
+    cm = mv[(mv["product"] == "ALL") & (mv["year"] == y) & (mv["month"] <= pack["month"])]
+    if len(cm) >= 3:
+        hi, lo = cm.loc[cm["volume"].idxmax()], cm.loc[cm["volume"].idxmin()]
+        F.append(f"Best month {MONTHS3[int(hi['month']) - 1]} ({hi['volume']:,.0f} L); "
+                 f"weakest {MONTHS3[int(lo['month']) - 1]} ({lo['volume']:,.0f} L).")
+
+    # 11 landing
+    pj = pack["projection"]["ALL"]
+    if pack["month"] < 12:
+        if np.isfinite(pj["seasonal"]):
+            line = (f"On {pj['ref']}'s seasonal profile the full year lands near "
+                    f"**{pj['seasonal']:,.0f} L**")
+            if np.isfinite(pj["prior_fy"]):
+                line += f" ({_sgn(_chg(pj['seasonal'], pj['prior_fy']))} on full-year {y - 1})"
+            F.append(line + f"; straight run-rate says {pj['runrate']:,.0f} L.")
+        else:
+            F.append(f"No complete earlier year to borrow a seasonal profile from, so the "
+                     f"only landing estimate is run-rate: about {pj['runrate']:,.0f} L.")
+    return F
+
+
+def _plain(s):
+    return s.replace("**", "")
+
+
+def _html(s):
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+
+
+def _wa(s):
+    return re.sub(r"\*\*(.+?)\*\*", r"*\1*", s)
+
+
+# ──────────────────────────────── exports ──────────────────────────────────
+def yearend_excel(pack):
+    yt = pack["years_table"].copy()
+    keep = ["year", "product", "stations", "months", "site_days", "volume",
+            "rate_per_site_day", "avg_price", "avg_cost", "revenue", "gross", "gross_pl",
+            "contribution", "contrib_pl", "cost_cov", "loss_l", "loss_pct", "loss_value",
+            "discharged", "shortage", "transit_pct", "floor_days", "floor_exposure",
+            "return_rate", "cash", "deposited", "banked_pct"]
+    sheets = {"Years compared": yt[[c for c in keep if c in yt.columns]],
+              "Findings": pd.DataFrame({"finding": [_plain(f) for f in pack["findings"]]})}
+    for p in ("ALL",) + GRADES:
+        sheets[f"Stations {p}"] = pack["station"][p]
+        m = month_matrix(pack["monthly"], p, pack["years"], pack["year"], pack["month"])
+        m.index = [MONTHS3[i - 1] for i in m.index]
+        sheets[f"Monthly {p}"] = m.reset_index().rename(columns={"index": "month"})
+        q, _ = quarter_table(pack["monthly"], p, pack["years"], pack["year"], pack["month"])
+        sheets[f"Quarterly {p}"] = q.reset_index()
+    for g in GRADES:
+        sheets[f"Price margin {g}"] = pack["price"][g]
+    sheets["Stock control"] = pack["control"]
+    ol = pack["projection"]["ALL"]["outlook"]
+    sheets["Outlook"] = ol
+    sheets = {k: (v.copy() if isinstance(v, pd.DataFrame) else v) for k, v in sheets.items()}
+    for k, v in sheets.items():
+        if isinstance(v, pd.DataFrame):
+            v.columns = [str(c) for c in v.columns]
+    return build_excel(sheets)
+
+
+def yearend_whatsapp(pack, generated):
+    y, lab, clab = pack["year"], pack["label"], pack["cmp_label"]
+    A = _yrow(pack, y, "ALL")
+    B = _yrow(pack, pack["primary"], "ALL") if pack["primary"] else None
+    L = [f"*SPARTAN FUEL — YEAR-END REVIEW*", f"_{lab}" +
+         (f" vs {clab}_" if clab else "_"), ""]
+    L.append("\U0001F4CA *THE YEAR SO FAR*")
+    for f in pack["findings"][:2]:
+        L.append(_wa(f))
+    L.append("")
+    L.append("ℹ️ *HOW TO READ THIS*")
+    L.append("• Both years are cut to the *same months* (Jan to the last full month), "
+             "so nobody compares ten months with twelve.")
+    L.append("• *Like-for-like* counts only sites that traded in both periods — it "
+             "tells you whether existing forecourts are really selling more, or the network "
+             "just got bigger.")
+    L.append("• *Per trading day* adjusts for days a site didn't send its return.")
+    L.append("")
+    names = {"PMS": "\U0001F534 *PETROL (PMS)*", "AGO": "\U0001F7E2 *DIESEL (AGO)*"}
+    for g in GRADES:
+        r = _yrow(pack, y, g)
+        b = _yrow(pack, pack["primary"], g) if pack["primary"] else None
+        L.append(names[g])
+        line = f"Sold {r['volume']:,.0f} L"
+        if b is not None and b["volume"]:
+            line += f" ({_sgn(_chg(r['volume'], b['volume']))} on {clab})"
+        L.append(line + ".")
+        if np.isfinite(r["avg_price"]):
+            L.append(f"Average pump price GHS {r['avg_price']:,.2f}/L"
+                     + (f" (was {b['avg_price']:,.2f})." if b is not None and
+                        np.isfinite(b["avg_price"]) else "."))
+        if np.isfinite(r["gross_pl"]) and r["cost_cov"] >= 80:
+            L.append(f"Gross margin GHS {r['gross']:,.0f} — {r['gross_pl']:,.3f}/L.")
+        sy = pack["station"][g]
+        if sy is not None and not sy.empty:
+            top = sy.head(3)
+            L.append("\U0001F3C6 Biggest sellers: " + ", ".join(
+                f"{t['station']} ({t['volume_cur']:,.0f} L)" for _, t in top.iterrows()) + ".")
+        L.append("")
+    L.append("\U0001F50E *ALSO WORTH KNOWING*")
+    for f in pack["findings"][2:]:
+        L.append("• " + _wa(f))
+    L.append("")
+    L.append("\U0001F4CE Full charts, the station league and month-by-month tables are in "
+             "the attached PDF.")
+    L.append(f"_Generated {generated}_")
+    return "\n".join(L)
+
+
+def build_yearend_pdf(meta, pack):
+    """Six A4 pages: summary, months, stations, price & margin, control & outlook,
+    data appendix. Same house style as the monthly report — Candara, the logo as
+    a watermark, PMS red / AGO green, prior years in graded greys."""
+    import textwrap as _tw
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle, FancyBboxPatch
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    FONT = _resolve_font()
+    INK_, SUB, LINE, DARK, SOFT = "#1d2330", "#6b7280", "#e3e6ea", "#0C1014", "#fbfbfc"
+    A4 = (8.27, 11.69)
+    plt.rcParams.update({"font.family": [FONT, "DejaVu Sans"], "axes.edgecolor": LINE,
+                         "text.color": INK_, "axes.labelcolor": INK_})
+    LOGO = _logo_rgba()
+    laspect = (LOGO.shape[0] / LOGO.shape[1]) if LOGO is not None else 1.15
+    y0, m0, prim = pack["year"], pack["month"], pack["primary"]
+    years = pack["years"]
+
+    def ycol(y, grade=None):
+        if y == y0:
+            return COLORS.get(grade, "#3A6EA5") if grade else "#3A6EA5"
+        others = [x for x in years if x != y0]
+        return YEAR_GREYS[min(others.index(y), len(YEAR_GREYS) - 1)]
+
+    def new_page():
+        fig = plt.figure(figsize=A4, dpi=150)
+        bg = fig.add_axes([0, 0, 1, 1]); bg.set_xlim(0, 1); bg.set_ylim(0, 1); bg.axis("off")
+        if LOGO is not None:
+            bw = 0.62; bh = bw * (A4[0] / A4[1]) * laspect
+            bg.imshow(LOGO, extent=[0.5 - bw / 2, 0.5 + bw / 2, 0.47 - bh / 2, 0.47 + bh / 2],
+                      origin="upper", alpha=0.05, zorder=0, aspect="auto")
+        return fig, bg
+
+    def band(fig, bg, title):
+        bg.add_patch(Rectangle((0, 0.9), 1, 0.1, color=DARK, zorder=1))
+        bg.add_patch(Rectangle((0, 0.897), 0.5, 0.006, color=COLORS["PMS"], zorder=2))
+        bg.add_patch(Rectangle((0.5, 0.897), 0.5, 0.006, color=COLORS["AGO"], zorder=2))
+        bg.text(0.06, 0.957, title, color="white", fontsize=15, fontweight="bold",
+                va="center", zorder=3)
+        bg.text(0.06, 0.922, meta["cover_sub"], color="#aab2bc", fontsize=8.4,
+                va="center", zorder=3)
+        if LOGO is not None:
+            lw = 0.085; lh = lw * (A4[0] / A4[1]) * laspect
+            ax = fig.add_axes([0.885, 0.905 + (0.095 - lh) / 2, lw, lh]); ax.axis("off")
+            ax.imshow(LOGO, origin="upper")
+
+    def footer(bg, txt):
+        bg.add_patch(Rectangle((0, 0), 1, 0.032, color="#f4f5f7", zorder=5))
+        bg.text(0.06, 0.016, meta["footer"], color=SUB, fontsize=6.8, va="center", zorder=6)
+        bg.text(0.94, 0.016, txt, color=SUB, fontsize=6.8, va="center", ha="right", zorder=6)
+
+    def heading(bg, y, text):
+        bg.text(0.06, y, text, fontsize=8.2, color=COLORS["PMS"], fontweight="bold", zorder=6)
+        bg.add_patch(Rectangle((0.06, y - 0.007), 0.03, 0.003, color=COLORS["PMS"], zorder=6))
+
+    def tidy(ax, grid="y"):
+        ax.set_facecolor("none")
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+        ax.spines["left"].set_color(LINE); ax.spines["bottom"].set_color(LINE)
+        ax.tick_params(colors=SUB, labelsize=7.5, length=0)
+        ax.grid(axis=grid, color="#eef0f2", zorder=1); ax.set_axisbelow(True)
+
+    def title(ax, t):
+        ax.set_title(t, fontsize=9.6, color=INK_, fontweight="bold", loc="left", pad=6)
+
+    def kfmt(v, _=None):
+        return f"{v / 1e6:.1f}M" if abs(v) >= 1e6 else (f"{v / 1e3:.0f}k" if abs(v) >= 1e3
+                                                         else f"{v:.0f}")
+
+    def table(rect, cols, rows, head, widths, fs=7.6, first_left=True):
+        ax = fig.add_axes(rect); ax.axis("off")
+        if not rows:
+            ax.text(0.5, 0.5, "No data.", ha="center", color=SUB); return
+        t = ax.table(cellText=rows, colLabels=cols, loc="upper center", cellLoc="right",
+                     colLoc="center", colWidths=widths)
+        t.auto_set_font_size(False); t.set_fontsize(fs); t.scale(1, 1.38)
+        for (r, c), cell in t.get_celld().items():
+            cell.set_edgecolor("#eceef1")
+            if r == 0:
+                cell.set_facecolor(head); cell.set_text_props(color="white", fontweight="bold")
+            else:
+                cell.set_facecolor("#ffffff" if r % 2 else "#f7f8fa")
+                if c == 0 and first_left:
+                    cell.set_text_props(fontweight="bold", ha="left"); cell.PAD = 0.04
+
+    f0 = lambda x: "—" if x is None or not np.isfinite(x) else f"{x:,.0f}"
+    f2 = lambda x: "—" if x is None or not np.isfinite(x) else f"{x:,.2f}"
+    f3 = lambda x: "—" if x is None or not np.isfinite(x) else f"{x:,.3f}"
+    pc = lambda x: "—" if x is None or not np.isfinite(x) else f"{x:+.1f}%"
+
+    pages = PdfPages(meta["_buffer"])
+    A = _yrow(pack, y0, "ALL")
+    B = _yrow(pack, prim, "ALL") if prim else None
+
+    # ── PAGE 1 · summary ──────────────────────────────────────────────────
+    fig, bg = new_page(); band(fig, bg, "SPARTAN FUEL — YEAR-END REVIEW")
+    gv = lambda r, k: (r[k] if r is not None else np.nan)
+    rP, rA = _yrow(pack, y0, "PMS"), _yrow(pack, y0, "AGO")
+    bP = _yrow(pack, prim, "PMS") if prim else None
+    bA = _yrow(pack, prim, "AGO") if prim else None
+    vs = f"vs {pack['cmp_label']}" if prim else "no comparison year"
+    gm_ok = A["vol_costed"] and A["cost_cov"] >= 80
+    cards = [("NETWORK LITRES", f0(A["volume"]), f"{pc(_chg(A['volume'], gv(B, 'volume')))} {vs}"),
+             ("PMS · PETROL", f0(rP["volume"]), f"{pc(_chg(rP['volume'], gv(bP, 'volume')))} {vs}"),
+             ("AGO · DIESEL", f0(rA["volume"]), f"{pc(_chg(rA['volume'], gv(bA, 'volume')))} {vs}"),
+             ("GROSS MARGIN", f"GHS {kfmt(A['gross'])}" if gm_ok else "—",
+              f"{f3(A['gross_pl'])} GHS/L" if gm_ok else "ex-depot cost incomplete")]
+    x0, w, gap, yc, h = 0.06, 0.205, 0.0133, 0.775, 0.09
+    for i, (lab, val, sub) in enumerate(cards):
+        x = x0 + i * (w + gap)
+        acc = [COLORS["PMS"], COLORS["PMS"], COLORS["AGO"], "#C5821C"][i]
+        bg.add_patch(FancyBboxPatch((x, yc), w, h, boxstyle="round,pad=0.004,rounding_size=0.010",
+                     linewidth=1, edgecolor=LINE, facecolor=SOFT, zorder=2))
+        bg.add_patch(Rectangle((x, yc), w, 0.004, color=acc, zorder=3))
+        bg.text(x + 0.014, yc + h - 0.020, lab, fontsize=6.3, color=SUB, va="center", zorder=3)
+        bg.text(x + 0.014, yc + 0.046, val, fontsize=14 if len(val) <= 10 else 11,
+                color=INK_, fontweight="bold", va="center", zorder=3)
+        bg.text(x + 0.014, yc + 0.016, sub, fontsize=6.1, color=SUB, va="center", zorder=3)
+
+    heading(bg, 0.742, "WHAT THE YEAR SAYS")
+    # keep the headline, the like-for-like read and the landing; fill the rest in order
+    fl = [_tw.wrap(_plain(f), width=120) for f in pack["findings"]]
+    room, LH, GAP = 0.722 - 0.335, 0.0146, 0.0062
+    need = lambda i: LH * len(fl[i]) + GAP
+    keep = {0, 1, len(fl) - 1} & set(range(len(fl)))
+    used = sum(need(i) for i in keep)
+    for i in range(len(fl)):
+        if i not in keep and used + need(i) <= room:
+            keep.add(i)
+            used += need(i)
+    yy = 0.722
+    for i in sorted(keep):
+        bg.text(0.06, yy, "▸", fontsize=7.9, color=COLORS["PMS"], va="top", zorder=6)
+        bg.text(0.078, yy, "\n".join(fl[i]), fontsize=7.9, color="#2b3038", va="top",
+                linespacing=1.42, zorder=6)
+        yy -= need(i)
+
+    heading(bg, 0.30, "YEARS SIDE BY SIDE — SAME MONTHS EACH YEAR")
+    rows = []
+    prev_vol = None
+    for y in years:
+        r = _yrow(pack, y, "ALL"); p_ = _yrow(pack, y, "PMS"); a_ = _yrow(pack, y, "AGO")
+        if not r["volume"]:
+            rows.append([period_label(y, m0), "no trading in the sheet"] + [""] * 6)
+            continue
+        rows.append([period_label(y, m0), f0(r["volume"]), f0(p_["volume"]), f0(a_["volume"]),
+                     f"{int(r['stations'])}", f0(r["rate_per_site_day"]),
+                     f3(r["gross_pl"]) if r["cost_cov"] >= 80 else "—",
+                     "—" if not np.isfinite(r["loss_pct"]) else f"{r['loss_pct']:.2f}%"])
+    table([0.06, 0.06, 0.88, 0.22],
+          ["Period", "Total L", "PMS L", "AGO L", "Sites", "L / site-day", "Gross/L", "Loss %"],
+          rows, DARK, [0.2, 0.13, 0.12, 0.12, 0.07, 0.12, 0.1, 0.09])
+    footer(bg, "Page 1  ·  Summary"); pages.savefig(fig); plt.close(fig)
+
+    # ── PAGE 2 · months ───────────────────────────────────────────────────
+    fig, bg = new_page(); band(fig, bg, "1  ·  MONTH BY MONTH")
+    mv = pack["monthly"]
+    for k, (g, rect) in enumerate((("PMS", [0.09, 0.64, 0.85, 0.2]),
+                                    ("AGO", [0.09, 0.37, 0.85, 0.2]))):
+        ax = fig.add_axes(rect); tidy(ax)
+        mm = month_matrix(mv, g, years, y0, m0)
+        n = len(years); bw = 0.8 / max(n, 1)
+        for i, y in enumerate(years):
+            ax.bar(np.arange(12) + (i - (n - 1) / 2) * bw, mm[y].values, width=bw,
+                   color=ycol(y, g), label=str(y), zorder=3)
+        ax.set_xticks(range(12)); ax.set_xticklabels(MONTHS3)
+        ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(kfmt))
+        ax.axvspan(m0 - 0.5, 11.5, color="#f3f4f6", zorder=0)
+        title(ax, f"{GLABEL[g]} — litres by month (shaded = after the report window)")
+        ax.legend(fontsize=7, frameon=False, ncol=n, loc="upper right")
+    cc = pack["cumulative"]
+    ax = fig.add_axes([0.09, 0.075, 0.85, 0.22]); tidy(ax, "both")
+    if not cc.empty:
+        for y in years:
+            c = cc[cc["year"] == y]
+            if not c.empty:
+                ax.plot(c["axis"], c["cum"], color=ycol(y), lw=2.4 if y == y0 else 1.5,
+                        label=str(y))
+        ax.xaxis.set_major_formatter(matplotlib.dates.DateFormatter("%b"))
+        ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(kfmt))
+        ax.legend(fontsize=7, frameon=False, loc="upper left")
+    title(ax, "Network litres, cumulative from 1 January")
+    footer(bg, "Page 2  ·  Months"); pages.savefig(fig); plt.close(fig)
+
+    # ── PAGE 3 · stations ─────────────────────────────────────────────────
+    fig, bg = new_page(); band(fig, bg, "2  ·  STATIONS — WHO GREW, WHO DIDN'T")
+    sy = pack["station"]["ALL"]
+    if prim and sy is not None and not sy.empty:
+        d = sy[sy["volume_prev"] > 0].sort_values("change")
+        ax = fig.add_axes([0.24, 0.55, 0.7, 0.31]); tidy(ax, "x")
+        if not d.empty:
+            ax.barh(range(len(d)), d["change"], color=[YOY_UP if v >= 0 else YOY_DOWN
+                                                       for v in d["change"]], zorder=3)
+            ax.set_yticks(range(len(d)))
+            ax.set_yticklabels([f"{s}{'' if st == 'like-for-like' else ' *'}"
+                                for s, st in zip(d["station"], d["status"])],
+                               fontweight="bold", color=INK_)
+            ax.axvline(0, color=INK_, lw=0.8)
+            ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(kfmt))
+            for i, (v, gp) in enumerate(zip(d["change"], d["growth_pct"])):
+                ax.text(v, i, f"  {pc(gp)}  " if v >= 0 else f"{pc(gp)}  ", va="center",
+                        ha="left" if v >= 0 else "right", fontsize=7, color=INK_)
+            span = max(abs(d["change"]).max(), 1) * 1.35
+            ax.set_xlim(-span if d["change"].min() < 0 else -span * 0.08, span)
+        title(ax, f"Change in litres, {pack['label']} vs {pack['cmp_label']}"
+                  "   (* = not like-for-like)")
+    else:
+        bg.text(0.5, 0.7, "No comparison year with trading data.", ha="center", color=SUB)
+    rows = []
+    for _, r in (sy.iterrows() if sy is not None else []):
+        rows.append([r["station"], f0(r["volume_cur"]), f0(r["volume_prev"]) if prim else "—",
+                     pc(r["growth_pct"]), pc(r["rate_growth_pct"]),
+                     f"{r['share_cur']:.1f}%" if np.isfinite(r["share_cur"]) else "—",
+                     "—" if not np.isfinite(r["rank_move"]) else f"{r['rank_move']:+.0f}",
+                     r["status"]])
+    table([0.06, 0.08, 0.88, 0.4],
+          ["Station", f"{y0} L", f"{prim} L" if prim else "Prior L", "Growth",
+           "Per trading day", "Share", "Rank Δ", "Status"],
+          rows, DARK, [0.17, 0.13, 0.13, 0.1, 0.13, 0.09, 0.09, 0.16], fs=7.4)
+    footer(bg, "Page 3  ·  Stations"); pages.savefig(fig); plt.close(fig)
+
+    # ── PAGE 4 · price & margin ───────────────────────────────────────────
+    fig, bg = new_page(); band(fig, bg, "3  ·  PRICE & MARGIN")
+    grid = {("PMS", "price"): [0.09, 0.53, 0.38, 0.31], ("AGO", "price"): [0.57, 0.53, 0.38, 0.31],
+            ("PMS", "gross_pl"): [0.09, 0.12, 0.38, 0.31], ("AGO", "gross_pl"): [0.57, 0.12, 0.38, 0.31]}
+    for (g, col), rect in grid.items():
+        ax = fig.add_axes(rect); tidy(ax, "both")
+        pm = pack["price"][g]
+        if not pm.empty:
+            for y in years:
+                c = pm[pm["year"] == y]
+                if y == y0:
+                    c = c[c["month"] <= m0]
+                if not c.empty and c[col].notna().any():
+                    ax.plot(c["month"], c[col], marker="o", ms=3, color=ycol(y, g),
+                            lw=2.2 if y == y0 else 1.4, label=str(y))
+            if col == "price":
+                c = pm[(pm["year"] == y0) & (pm["month"] <= m0)]
+                if c["floor"].notna().any():
+                    ax.plot(c["month"], c["floor"], ls=":", color=INK_, lw=1.2,
+                            label=f"NPA floor {y0}")
+        ax.set_xticks(range(1, 13)); ax.set_xticklabels([m[0] for m in MONTHS3])
+        ax.legend(fontsize=6.5, frameon=False)
+        title(ax, f"{g} — " + ("avg pump price GHS/L" if col == "price"
+                                     else "gross margin GHS/L"))
+    bg.text(0.06, 0.06, "Gross margin = pump price − ex-depot cost (base + duties & levies) "
+            "on litres where both are known. Months without an ex-depot entry are blank, "
+            "not zero.", fontsize=7.4, color=SUB, zorder=6)
+    footer(bg, "Page 4  ·  Price & margin"); pages.savefig(fig); plt.close(fig)
+
+    # ── PAGE 5 · control & outlook ────────────────────────────────────────
+    fig, bg = new_page(); band(fig, bg, "4  ·  CONTROL, SUPPLY & OUTLOOK")
+    rows = []
+    for y in years:
+        r = _yrow(pack, y, "ALL")
+        if not r["volume"]:
+            rows.append([str(y), "no trading"] + [""] * 6)
+            continue
+        rows.append([str(y), f0(r["loss_l"]),
+                     "—" if not np.isfinite(r["loss_pct"]) else f"{r['loss_pct']:.2f}%",
+                     f0(r["loss_value"]), f0(r["shortage"]),
+                     "—" if not np.isfinite(r["transit_pct"]) else f"{r['transit_pct']:.2f}%",
+                     f"{int(r['floor_days'])}" if r["floor_checked_days"] else "—",
+                     "—" if not np.isfinite(r["return_rate"]) else f"{r['return_rate']:.0f}%"])
+    table([0.06, 0.73, 0.88, 0.13],
+          ["Year", "Stock lost L", "Loss %", "Loss GHS", "Transit short L", "Transit %",
+           "Below floor", "Returns"], rows, DARK,
+          [0.1, 0.13, 0.1, 0.13, 0.14, 0.1, 0.12, 0.1])
+    ctl = pack["control"]
+    ax = fig.add_axes([0.22, 0.4, 0.72, 0.26]); tidy(ax, "x")
+    if ctl is not None and not ctl.empty:
+        d = ctl.sort_values("loss_pct_cur")
+        yy_ = np.arange(len(d))
+        ax.barh(yy_ + 0.2, d["loss_pct_cur"], height=0.38, color="#3A6EA5", label=str(y0), zorder=3)
+        if prim:
+            ax.barh(yy_ - 0.2, d["loss_pct_prev"], height=0.38, color=YEAR_GREYS[1],
+                    label=str(prim), zorder=3)
+        ax.set_yticks(yy_); ax.set_yticklabels(d["station"], fontweight="bold", color=INK_)
+        ax.legend(fontsize=7, frameon=False)
+    title(ax, "Stock loss as % of throughput, by station")
+    pj = pack["projection"]["ALL"]
+    ax = fig.add_axes([0.09, 0.08, 0.85, 0.23]); tidy(ax)
+    cm = month_matrix(mv, "ALL", years, y0, m0)
+    if y0 in cm.columns:
+        ax.bar(range(1, 13), cm[y0].values, color="#3A6EA5", label=f"{y0} actual", zorder=3)
+    if not pj["outlook"].empty:
+        ax.bar(pj["outlook"]["month"], pj["outlook"]["projected"], color="none",
+               edgecolor="#3A6EA5", hatch="///", lw=1, label=f"{y0} projected", zorder=3)
+    if prim and prim in cm.columns:
+        ax.plot(range(1, 13), month_matrix(mv, "ALL", years, -1, 12)[prim].values,
+                color=YEAR_GREYS[0], marker="o", ms=3, lw=1.6, label=str(prim), zorder=5)
+    ax.set_xticks(range(1, 13)); ax.set_xticklabels(MONTHS3)
+    ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(kfmt))
+    ax.legend(fontsize=7, frameon=False, ncol=3)
+    lt = (f"Outlook — full year ≈ {f0(pj['seasonal'])} L on {pj['ref']}'s seasonal "
+          f"profile (run-rate {f0(pj['runrate'])} L)" if np.isfinite(pj["seasonal"])
+          and m0 < 12 else f"Network litres by month — {y0}")
+    title(ax, lt)
+    footer(bg, "Page 5  ·  Control & outlook"); pages.savefig(fig); plt.close(fig)
+
+    # ── PAGE 6 · appendix ─────────────────────────────────────────────────
+    fig, bg = new_page(); band(fig, bg, "5  ·  APPENDIX — LITRES BY MONTH")
+    for g, rect in (("PMS", [0.06, 0.5, 0.88, 0.34]), ("AGO", [0.06, 0.1, 0.88, 0.34])):
+        mm = month_matrix(mv, g, years, y0, m0)
+        rows = []
+        for mth in range(1, 13):
+            row = [MONTHS3[mth - 1]] + [f0(mm.loc[mth, y]) for y in years]
+            if prim:
+                row.append(pc(_chg(mm.loc[mth, y0], mm.loc[mth, prim])) if mth <= m0 else "")
+            rows.append(row)
+        tot = ["Jan–" + MONTHS3[m0 - 1]] + [f0(mm.loc[1:m0, y].sum(min_count=1))
+                                                 for y in years]
+        if prim:
+            tot.append(pc(_chg(mm.loc[1:m0, y0].sum(), mm.loc[1:m0, prim].sum())))
+        rows.append(tot)
+        cols = ["Month"] + [str(y) for y in years] + ([f"YoY vs {prim}"] if prim else [])
+        n = len(cols)
+        bg.text(0.06, rect[1] + rect[3] + 0.012, GLABEL[g], fontsize=10, fontweight="bold",
+                color=INK_, zorder=6)
+        table(rect, cols, rows, COLORS[g], [0.16] + [0.84 / (n - 1)] * (n - 1), fs=7.6)
+    footer(bg, "Page 6  ·  Appendix"); pages.savefig(fig); plt.close(fig)
+
+    pages.close()
+    return meta["_buffer"].getvalue()
 
 
 # ─────────────────────────────────── theme ─────────────────────────────────
@@ -3341,6 +4470,71 @@ def main():
                          "Company", "Raw JSON"])
 
         with etabs[0]:
+            with st.expander("📥 Import ex-depot cost from the BDC sales book", expanded=False):
+                st.markdown(
+                    "<span class='note'>Upload the BDC's sales workbook (the one with the "
+                    "<b>Sales</b> sheet). Spartan's cost is whatever the BDC charged the named "
+                    "customer each day, litre-weighted where it lifted at more than one price. "
+                    "That price is levy-inclusive, so the duties table is cleared — adding it "
+                    "again counts the levies twice. Nothing is written until you press "
+                    "Apply.</span>", unsafe_allow_html=True)
+                bc1, bc2 = st.columns([2, 1])
+                book = bc1.file_uploader("Sales book (.xlsx)", type=["xlsx", "xlsm"],
+                                         key="bookup")
+                who = bc2.text_input("Customer in the book", value=SALES_BOOK_OMC, key="bookomc",
+                                     help="Matched ignoring spaces, hyphens and case, so "
+                                          "'JD- LINK OIL…' and 'JD-LINK OIL…' are one customer.")
+                if book is not None:
+                    tbls, aud, bad = {}, pd.DataFrame(), None
+                    try:
+                        tbls, aud = exdepot_from_sales_book(book, who)
+                    except Exception as e:
+                        bad = str(e)
+                    if bad:
+                        st.error(f"Couldn't read the book: {bad}")
+                    elif not tbls:
+                        st.warning(f"No PMS or AGO liftings for '{who}' in that file.")
+                    else:
+                        summ = []
+                        for g, t in tbls.items():
+                            a = aud[aud["product"] == g]
+                            old = resolved_exdepot(cfg, g)
+                            summ.append({"Grade": g, "Lifting days": len(a),
+                                         "From": a["Date"].min().strftime("%d %b %Y"),
+                                         "To": a["Date"].max().strftime("%d %b %Y"),
+                                         "Price changes": len(t),
+                                         "Multi-price days": int((a["hi"] > a["lo"]).sum()),
+                                         "Latest cost": a["price"].iloc[-1],
+                                         "Cost on file now": dated_rate(old, a["Date"].max())})
+                        st.dataframe(pd.DataFrame(summ).style.format(
+                            {"Latest cost": "{:,.4f}", "Cost on file now": "{:,.4f}"},
+                            na_rep="—"), use_container_width=True, hide_index=True)
+                        mp = aud[aud["hi"] > aud["lo"]].sort_values("Date", ascending=False)
+                        if len(mp):
+                            st.caption("Days the customer lifted at more than one price — "
+                                       "check the weighted figure looks right:")
+                            st.dataframe(mp.head(15).assign(Date=mp["Date"].dt.strftime("%d %b %Y"))
+                                         .rename(columns={"product": "Grade", "price": "Weighted",
+                                                          "lo": "Low", "hi": "High",
+                                                          "loads": "Loads", "litres": "Litres"})
+                                         .style.format({"Weighted": "{:,.4f}", "Low": "{:,.2f}",
+                                                        "High": "{:,.2f}", "Litres": "{:,.0f}"}),
+                                         use_container_width=True, hide_index=True)
+                        clear_tax = st.checkbox("Clear the duties + levies table for PMS and AGO "
+                                                "(book price already includes them)", value=True,
+                                                key="bookcleartax")
+                        if st.button("✓ Apply to the commercial model", key="bookapply"):
+                            for g, t in tbls.items():
+                                ec_ = cfg["economics"].setdefault(g, {})
+                                ec_["exdepot_base"] = t
+                                if clear_tax:
+                                    ec_["tax"] = {}
+                                for k in (f"exdepot_base_{g}", f"tax_{g}"):
+                                    st.session_state.pop(k, None)
+                            st.session_state["omc_cfg"] = cfg
+                            st.toast("Ex-depot cost applied. Press 💾 Save settings — or on the "
+                                     "hosted app, ⬇️ Download config and commit it.", icon="✅")
+                            st.rerun()
             st.markdown("<div class='eyebrow'>Per-litre economics by grade</div>",
                         unsafe_allow_html=True)
             for rp in ("PMS", "AGO"):
@@ -3592,9 +4786,467 @@ def main():
                 st.error(f"Couldn't write the config file: {e}")
         c2.caption("Changes apply to this session immediately; save to keep them for next time.")
 
+
+    # ════════════════════════ MODULE · YEAR-END REVIEW ═════════════════════
+    @st.cache_data(show_spinner="Building the year-end review…")
+    def _ye_pack(df_, cfg_json, year_, month_, cmp_, primary_):
+        return yearend_pack(df_, json.loads(cfg_json), year_, month_, list(cmp_), primary_)
+
+    def render_yearend():
+        acc = "#3A6EA5"
+        _acc(acc)
+        yrs = data_years(df)
+        if not yrs:
+            st.info("No sales in the sheet yet.")
+            return
+        ly, lm = last_full_month(dmax)
+        st.sidebar.markdown("#### Year-end review")
+        st.sidebar.markdown("<span class='note'>1 January to the last full month, with every "
+                            "comparison year cut to the same months.</span>",
+                            unsafe_allow_html=True)
+        yopts = sorted(set(yrs) | ({ly} if ly >= min(yrs) else set()), reverse=True)
+        year = st.sidebar.selectbox("Report year", yopts,
+                                    index=yopts.index(ly) if ly in yopts else 0, key="ye_year")
+        max_m = lm if year == ly else (12 if year < ly else 1)
+        month = st.sidebar.selectbox("Through month", list(range(1, max_m + 1)),
+                                     index=max_m - 1, format_func=lambda m: MONTHS3[m - 1],
+                                     key=f"ye_month_{year}",
+                                     help="Defaults to the last month that has fully ended "
+                                          "and been reported.")
+        prior = [y for y in yrs if y < year]
+        cmp_years = st.sidebar.multiselect("Compare with", prior, default=prior,
+                                           key=f"ye_cmp_{year}")
+        primary = None
+        if cmp_years:
+            ordered = sorted(cmp_years, reverse=True)
+            primary = st.sidebar.selectbox("Headline comparison", ordered, index=0,
+                                           key=f"ye_primary_{year}",
+                                           help="The year every YoY % and the station "
+                                                "league are measured against.")
+        _refresh("yerefresh")
+
+        pack = _ye_pack(df,
+                        json.dumps(cfg, sort_keys=True, default=str),
+                        int(year), int(month), tuple(sorted(cmp_years)), primary)
+        lab, clab = pack["label"], pack["cmp_label"]
+        A = _yrow(pack, year, "ALL")
+        B = _yrow(pack, primary, "ALL") if primary else None
+        have_b = B is not None and B["volume"] > 0
+
+        _hero("📅", "Year-end Review",
+              f"{lab} · {fmt(ytd_window(year, month)[0])} → {fmt(ytd_window(year, month)[1])}"
+              + (f" · compared with {', '.join(str(y) for y in sorted(cmp_years, reverse=True))}"
+                 if cmp_years else " · no comparison year"), badge=str(year))
+        if year == ly and month == lm and dmax > ytd_window(year, month)[1]:
+            st.caption(f"{MONTHS3[dmax.month - 1]} {dmax.year} is still open in the sheet "
+                       f"(data to {fmt(dmax)}), so it is left out until it closes.")
+        if cmp_years and not have_b:
+            st.warning(f"{clab} has no recorded trading in the sheet, so there is nothing "
+                       "like-for-like to measure against. Pick a different headline year, or "
+                       "read this as a single-year review.")
+
+        dl = lambda a, b: "" if not have_b else f"{_sgn(_chg(a, b))} vs {clab}"
+        tabs = st.tabs(["Summary", "Years compared", "Monthly", "Stations", "Price & margin",
+                        "Control & supply", "Seasonality & outlook", "📄 Export"])
+
+        # ── Summary ──
+        with tabs[0]:
+            rP, rA = _yrow(pack, year, "PMS"), _yrow(pack, year, "AGO")
+            bP = _yrow(pack, primary, "PMS") if have_b else None
+            bA = _yrow(pack, primary, "AGO") if have_b else None
+            gm_ok = A["vol_costed"] and A["cost_cov"] >= 80
+            _cards([("Network litres", _n0(A["volume"]), "L",
+                     dl(A["volume"], B["volume"] if have_b else np.nan) or f"{int(A['stations'])} sites"),
+                    ("PMS · Petrol", _n0(rP["volume"]), "L",
+                     dl(rP["volume"], bP["volume"] if have_b else np.nan)),
+                    ("AGO · Diesel", _n0(rA["volume"]), "L",
+                     dl(rA["volume"], bA["volume"] if have_b else np.nan)),
+                    ("Gross margin", _n0(A["gross"]) if gm_ok else "—", "GHS",
+                     f"{_n2(A['gross_pl'])} GHS/L" + (f" · was {_n2(B['gross_pl'])}"
+                                                       if have_b and B["cost_cov"] >= 80 else "")
+                     if gm_ok else "ex-depot cost incomplete")], acc)
+            st.markdown("<div class='summary'>📅 " + "<br>".join(
+                "▸ " + _html(f) for f in pack["findings"]) + "</div>", unsafe_allow_html=True)
+
+            br = pack["bridge"]
+            if have_b and br:
+                st.markdown("<div class='eyebrow'>Where the change in litres came from</div>",
+                            unsafe_allow_html=True)
+                fig = go.Figure(go.Waterfall(
+                    orientation="v",
+                    measure=["absolute", "relative", "relative", "relative", "relative", "total"],
+                    x=[clab, f"Like-for-like ({br['n_lfl']})", f"New sites ({br['n_new']})",
+                       f"Lost sites ({br['n_lost']})", f"Partial ({br['n_partial']})", lab],
+                    y=[br["prev"], br["lfl"], br["new"], br["lost"], br["partial"], br["cur"]],
+                    text=[_n0(br["prev"]), f"{br['lfl']:+,.0f}", f"{br['new']:+,.0f}",
+                          f"{br['lost']:+,.0f}", f"{br['partial']:+,.0f}", _n0(br["cur"])],
+                    textposition="outside",
+                    connector={"line": {"color": "rgba(140,140,140,.35)"}},
+                    increasing={"marker": {"color": YOY_UP}},
+                    decreasing={"marker": {"color": YOY_DOWN}},
+                    totals={"marker": {"color": acc}}))
+                fig.update_layout(title="Volume bridge — litres")
+                st.plotly_chart(style_fig(fig, 380, acc), use_container_width=True)
+                st.caption("Like-for-like = sites that reported on at least 60% of the days in "
+                           "both windows. Partial = sites that traded in both, but too little in "
+                           "one of them to be a fair comparison.")
+
+        # ── Years compared ──
+        with tabs[1]:
+            st.markdown(f"<div class='eyebrow'>Same months every year · Jan–"
+                        f"{MONTHS3[month - 1]}</div>", unsafe_allow_html=True)
+            yt = pack["years_table"]
+            metrics = [("Litres", "volume", "{:,.0f}"), ("Trading sites", "stations", "{:,.0f}"),
+                       ("Months with sales", "months", "{:,.0f}"),
+                       ("Site-days reported", "site_days", "{:,.0f}"),
+                       ("Litres per site-day", "rate_per_site_day", "{:,.0f}"),
+                       ("Avg pump price GHS/L", "avg_price", "{:,.2f}"),
+                       ("Avg ex-depot GHS/L", "avg_cost", "{:,.2f}"),
+                       ("Revenue GHS", "revenue", "{:,.0f}"),
+                       ("Gross margin GHS", "gross", "{:,.0f}"),
+                       ("Gross margin GHS/L", "gross_pl", "{:,.3f}"),
+                       ("Contribution GHS", "contribution", "{:,.0f}"),
+                       ("Cost coverage %", "cost_cov", "{:,.0f}"),
+                       ("Stock lost L", "loss_l", "{:,.0f}"), ("Loss % of throughput", "loss_pct", "{:,.2f}"),
+                       ("Transit shortage L", "shortage", "{:,.0f}"), ("Transit %", "transit_pct", "{:,.2f}"),
+                       ("Site-days below floor", "floor_days", "{:,.0f}"),
+                       ("Floor exposure GHS", "floor_exposure", "{:,.0f}")]
+            for p in ("ALL",) + GRADES:
+                if p == "ALL":
+                    st.markdown("<div class='prodhead' style='--acc2:#3A6EA5'>Network · PMS + AGO"
+                                "</div>", unsafe_allow_html=True)
+                else:
+                    phead(p)
+                sub = yt[yt["product"] == p].set_index("year")
+                ms = metrics + ([("Returns received %", "return_rate", "{:,.0f}"),
+                                 ("Cash generated GHS", "cash", "{:,.0f}"),
+                                 ("Banked %", "banked_pct", "{:,.0f}")] if p == "ALL" else [])
+                rows = []
+                for name, col, f in ms:
+                    if col not in sub.columns:
+                        continue
+                    if p == "ALL" and col in ("avg_price", "avg_cost"):
+                        continue
+                    row = {"Metric": name}
+                    for y in pack["years"]:
+                        v = sub.loc[y, col] if y in sub.index else np.nan
+                        row[str(y)] = "—" if v is None or not np.isfinite(v) else f.format(v)
+                    if have_b:
+                        a_, b_ = sub.loc[year, col], sub.loc[primary, col]
+                        row[f"Δ vs {primary}"] = ("—" if not (np.isfinite(a_) and np.isfinite(b_))
+                                                  else (f"{a_ - b_:+.2f} pp" if col.endswith("pct")
+                                                        or col in ("cost_cov", "return_rate",
+                                                                   "banked_pct")
+                                                        else _sgn(_chg(a_, b_))))
+                    rows.append(row)
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
+                             height=min(720, 40 + 35 * len(rows)))
+            st.markdown("<div class='eyebrow'>Full calendar years, for context</div>",
+                        unsafe_allow_html=True)
+            fy = pack["monthly"][pack["monthly"]["product"] == "ALL"]
+            fy = fy[~((fy["year"] == year) & (fy["month"] > month))]
+            fyt = (fy.groupby("year").agg(litres=("volume", "sum"), months=("month", "nunique"))
+                     .reset_index().sort_values("year", ascending=False))
+            fyt["note"] = ["report window" if y == year else
+                           ("complete" if m == 12 else f"only {m} month(s) in the sheet")
+                           for y, m in zip(fyt["year"], fyt["months"])]
+            st.dataframe(fyt.rename(columns={"year": "Year", "litres": "Litres",
+                                             "months": "Months", "note": "Coverage"})
+                         .style.format({"Litres": "{:,.0f}"}),
+                         use_container_width=True, hide_index=True)
+
+        # ── Monthly ──
+        with tabs[2]:
+            grade = st.radio("Grade", ["ALL", "PMS", "AGO"], horizontal=True, key="ye_mgrade",
+                             format_func=lambda p: "Network" if p == "ALL" else GLABEL[p])
+            mm = month_matrix(pack["monthly"], grade, pack["years"], year, month)
+            fig = go.Figure()
+            others = [y for y in pack["years"] if y != year]
+            for y in pack["years"]:
+                colr = (COLORS.get(grade, acc) if y == year
+                        else YEAR_GREYS[min(others.index(y), len(YEAR_GREYS) - 1)])
+                fig.add_bar(x=MONTHS3, y=mm[y].values, name=str(y), marker_color=colr)
+            fig.add_vrect(x0=month - 0.5, x1=11.5, fillcolor="rgba(140,140,140,.08)",
+                          line_width=0, annotation_text="outside window",
+                          annotation_position="top left")
+            fig.update_layout(barmode="group", title="Litres by month")
+            st.plotly_chart(style_fig(fig, 380, acc), use_container_width=True)
+
+            cc = cumulative_curves(df, pack["years"], month, grade)
+            if not cc.empty:
+                fig = go.Figure()
+                for y in pack["years"]:
+                    c = cc[cc["year"] == y]
+                    if c.empty:
+                        continue
+                    colr = (COLORS.get(grade, acc) if y == year
+                            else YEAR_GREYS[min(others.index(y), len(YEAR_GREYS) - 1)])
+                    fig.add_scatter(x=c["axis"], y=c["cum"], name=str(y), mode="lines",
+                                    line=dict(color=colr, width=3 if y == year else 1.8))
+                fig.update_xaxes(tickformat="%b")
+                fig.update_layout(title="Cumulative litres from 1 January")
+                st.plotly_chart(style_fig(fig, 340, acc), use_container_width=True)
+
+            show = mm.copy()
+            show.index = [MONTHS3[i - 1] for i in show.index]
+            show.columns = [str(c) for c in show.columns]
+            if have_b:
+                show[f"YoY vs {primary}"] = [
+                    _chg(mm.loc[i, year], mm.loc[i, primary]) if i <= month else np.nan
+                    for i in range(1, 13)]
+            tot = mm.loc[1:month].sum(min_count=1)
+            trow = {str(k): v for k, v in tot.items()}
+            if have_b:
+                trow[f"YoY vs {primary}"] = _chg(tot[year], tot[primary])
+            show.loc[f"Jan–{MONTHS3[month - 1]}"] = pd.Series(trow)
+            fmts = {c: "{:,.0f}" for c in show.columns if not c.startswith("YoY")}
+            fmts.update({c: "{:+.1f}%" for c in show.columns if c.startswith("YoY")})
+            st.dataframe(show.style.format(fmts, na_rep="—"), use_container_width=True)
+
+        # ── Stations ──
+        with tabs[3]:
+            grade = st.radio("Grade", ["ALL", "PMS", "AGO"], horizontal=True, key="ye_sgrade",
+                             format_func=lambda p: "Network" if p == "ALL" else GLABEL[p])
+            sy = pack["station"][grade]
+            if sy is None or sy.empty:
+                st.info("No station data.")
+            else:
+                c3, p3 = concentration(sy)
+                counts = sy["status"].value_counts()
+                _cards([("Trading sites", _n0(int((sy["volume_cur"] > 0).sum())), "",
+                         f"{counts.get('like-for-like', 0)} like-for-like"),
+                        ("New sites", _n0(counts.get("new", 0)), "", "no sales last time"),
+                        ("Lost / silent", _n0(counts.get("lost", 0)), "", "no sales this time"),
+                        ("Top-3 share", "—" if not np.isfinite(c3) else f"{c3:.0f}", "%",
+                         "" if not np.isfinite(p3) else f"was {p3:.0f}%")], acc)
+                if have_b:
+                    d = sy[sy["volume_prev"] > 0].dropna(subset=["growth_pct"]).sort_values("growth_pct")
+                    if not d.empty:
+                        fig = go.Figure(go.Bar(
+                            y=[f"{s}{'' if st_ == 'like-for-like' else ' *'}"
+                               for s, st_ in zip(d["station"], d["status"])],
+                            x=d["growth_pct"], orientation="h",
+                            marker_color=[YOY_UP if v >= 0 else YOY_DOWN for v in d["growth_pct"]],
+                            text=[f"{v:+.1f}% ({c:+,.0f} L)" for v, c in zip(d["growth_pct"], d["change"])],
+                            textposition="outside", textfont=dict(color=INK, size=11),
+                            cliponaxis=False))
+                        fig.add_vline(x=0, line_color=INK)
+                        fig.update_layout(title=f"Growth vs {clab}  (* = not like-for-like)")
+                        st.plotly_chart(style_fig(fig, max(300, 34 * len(d)), acc),
+                                        use_container_width=True)
+                show = sy.rename(columns={
+                    "station": "Station", "volume_cur": f"{year} L", "volume_prev": f"{primary} L",
+                    "change": "Change L", "growth_pct": "Growth %", "days_cur": f"Days {year}",
+                    "days_prev": f"Days {primary}", "rate_cur": "L/day now", "rate_prev": "L/day before",
+                    "rate_growth_pct": "Per-day growth %", "share_cur": "Share %",
+                    "share_prev": "Share before %", "rank_cur": "Rank", "rank_move": "Rank Δ",
+                    "status": "Status"})
+                cols = ["Station", f"{year} L", f"{primary} L", "Change L", "Growth %",
+                        f"Days {year}", f"Days {primary}", "L/day now", "L/day before",
+                        "Per-day growth %", "Share %", "Share before %", "Rank", "Rank Δ", "Status"]
+                if not primary:
+                    cols = [c for c in cols if "None" not in c]
+                cols = [c for c in cols if c in show.columns]
+                st.dataframe(show[cols].style.format({
+                    f"{year} L": "{:,.0f}", f"{primary} L": "{:,.0f}", "Change L": "{:+,.0f}",
+                    "Growth %": "{:+.1f}", f"Days {year}": "{:,.0f}", f"Days {primary}": "{:,.0f}",
+                    "L/day now": "{:,.0f}", "L/day before": "{:,.0f}",
+                    "Per-day growth %": "{:+.1f}", "Share %": "{:.1f}", "Share before %": "{:.1f}",
+                    "Rank": "{:.0f}", "Rank Δ": "{:+.0f}"}, na_rep="—"),
+                    use_container_width=True, hide_index=True)
+                st.caption("Per-day growth compares litres per reported trading day, so a site "
+                           "that missed returns isn't punished for paperwork. When it disagrees "
+                           "with plain growth, the difference is reporting gaps, not customers.")
+
+        # ── Price & margin ──
+        with tabs[4]:
+            if not _cfg_gate(["PMS", "AGO"]):
+                pass
+            others = [y for y in pack["years"] if y != year]
+            for g in GRADES:
+                pm = pack["price"][g]
+                phead(g)
+                if pm.empty:
+                    st.info("No priced sales.")
+                    continue
+                c1, c2 = st.columns(2, gap="large")
+                for col_, holder, ttl in (("price", c1, "Average pump price, GHS/L"),
+                                          ("gross_pl", c2, "Gross margin, GHS/L")):
+                    fig = go.Figure()
+                    for y in pack["years"]:
+                        c = pm[pm["year"] == y]
+                        if y == year:
+                            c = c[c["month"] <= month]
+                        if c.empty or not c[col_].notna().any():
+                            continue
+                        colr = (COLORS[g] if y == year
+                                else YEAR_GREYS[min(others.index(y), len(YEAR_GREYS) - 1)])
+                        fig.add_scatter(x=[MONTHS3[m - 1] for m in c["month"]], y=c[col_],
+                                        name=str(y), mode="lines+markers",
+                                        line=dict(color=colr, width=3 if y == year else 1.8))
+                    if col_ == "price":
+                        c = pm[(pm["year"] == year) & (pm["month"] <= month)]
+                        if c["floor"].notna().any():
+                            fig.add_scatter(x=[MONTHS3[m - 1] for m in c["month"]], y=c["floor"],
+                                            name="NPA floor", mode="lines",
+                                            line=dict(color=INK, dash="dot", width=1.6))
+                        if c["exdepot"].notna().any():
+                            fig.add_scatter(x=[MONTHS3[m - 1] for m in c["month"]], y=c["exdepot"],
+                                            name="Ex-depot", mode="lines",
+                                            line=dict(color="#C5821C", dash="dash", width=1.6))
+                    fig.update_xaxes(categoryorder="array", categoryarray=MONTHS3)
+                    fig.update_layout(title=ttl)
+                    with holder:
+                        st.plotly_chart(style_fig(fig, 330, COLORS[g]), use_container_width=True)
+                yt = pack["years_table"]
+                sub = yt[yt["product"] == g][["year", "volume", "avg_price", "avg_cost", "gross",
+                                              "gross_pl", "contribution", "contrib_pl", "cost_cov"]]
+                st.dataframe(sub.rename(columns={
+                    "year": "Year", "volume": "Litres", "avg_price": "Avg price",
+                    "avg_cost": "Avg ex-depot", "gross": "Gross GHS", "gross_pl": "Gross/L",
+                    "contribution": "Contribution GHS", "contrib_pl": "Contribution/L",
+                    "cost_cov": "Cost coverage %"}).style.format({
+                    "Litres": "{:,.0f}", "Avg price": "{:,.2f}", "Avg ex-depot": "{:,.2f}",
+                    "Gross GHS": "{:,.0f}", "Gross/L": "{:,.3f}", "Contribution GHS": "{:,.0f}",
+                    "Contribution/L": "{:,.3f}", "Cost coverage %": "{:,.0f}"}, na_rep="—"),
+                    use_container_width=True, hide_index=True)
+            st.caption("Prices are volume-weighted, so a busy week counts for more than a quiet "
+                       "one. Margin uses only litres where both pump price and ex-depot cost are "
+                       "known; cost coverage tells you how many that is.")
+
+        # ── Control & supply ──
+        with tabs[5]:
+            yt = pack["years_table"]
+            ya = yt[yt["product"] == "ALL"]
+            st.dataframe(ya[["year", "loss_l", "loss_pct", "loss_value", "discharged", "shortage",
+                             "transit_pct", "floor_days", "floor_exposure", "return_rate"]]
+                         .rename(columns={"year": "Year", "loss_l": "Stock lost L",
+                                          "loss_pct": "Loss %", "loss_value": "Loss GHS (cost)",
+                                          "discharged": "Discharged L", "shortage": "Transit short L",
+                                          "transit_pct": "Transit %", "floor_days": "Below floor (site-days)",
+                                          "floor_exposure": "Floor exposure GHS",
+                                          "return_rate": "Returns %"})
+                         .style.format({"Stock lost L": "{:,.0f}", "Loss %": "{:,.2f}",
+                                        "Loss GHS (cost)": "{:,.0f}", "Discharged L": "{:,.0f}",
+                                        "Transit short L": "{:,.0f}", "Transit %": "{:,.2f}",
+                                        "Below floor (site-days)": "{:,.0f}",
+                                        "Floor exposure GHS": "{:,.0f}", "Returns %": "{:,.0f}"},
+                                       na_rep="—"),
+                         use_container_width=True, hide_index=True)
+            ctl = pack["control"]
+            if ctl is not None and not ctl.empty:
+                d = ctl.sort_values("loss_pct_cur")
+                fig = go.Figure()
+                fig.add_bar(y=d["station"], x=d["loss_pct_cur"], orientation="h", name=str(year),
+                            marker_color=acc)
+                if have_b:
+                    fig.add_bar(y=d["station"], x=d["loss_pct_prev"], orientation="h",
+                                name=str(primary), marker_color=YEAR_GREYS[1])
+                fig.update_layout(barmode="group", title="Stock loss as % of throughput")
+                st.plotly_chart(style_fig(fig, max(300, 40 * len(d)), acc), use_container_width=True)
+                st.dataframe(ctl.rename(columns={
+                    "station": "Station", "loss_cur": f"Lost L {year}", "thru_cur": f"Throughput {year}",
+                    "loss_pct_cur": f"Loss % {year}", "loss_prev": f"Lost L {primary}",
+                    "thru_prev": f"Throughput {primary}", "loss_pct_prev": f"Loss % {primary}",
+                    "change_pp": "Change pp"}).style.format(
+                    {c: "{:,.0f}" for c in [f"Lost L {year}", f"Throughput {year}",
+                                            f"Lost L {primary}", f"Throughput {primary}"]}
+                    | {f"Loss % {year}": "{:.2f}", f"Loss % {primary}": "{:.2f}",
+                       "Change pp": "{:+.2f}"}, na_rep="—"),
+                    use_container_width=True, hide_index=True)
+            st.caption("Loss counts only net negative dip variance per site and grade; single "
+                       "days above 1,000 L are treated as unbooked deliveries, as everywhere else "
+                       "in the system.")
+
+        # ── Seasonality & outlook ──
+        with tabs[6]:
+            q, pq = quarter_table(pack["monthly"], "ALL", pack["years"], year, month)
+            qs = q.copy()
+            qs.index = [f"Q{i}" + (" (partial)" if i == pq else "") for i in qs.index]
+            qs.columns = [str(c) for c in qs.columns]
+            if have_b:
+                qs[f"YoY vs {primary}"] = [_chg(q.loc[i, year], q.loc[i, primary])
+                                           if i != pq else np.nan for i in q.index]
+            st.markdown("<div class='eyebrow'>Quarters</div>", unsafe_allow_html=True)
+            st.dataframe(qs.style.format({c: ("{:+.1f}%" if c.startswith("YoY") else "{:,.0f}")
+                                          for c in qs.columns}, na_rep="—"),
+                         use_container_width=True)
+            si, full = pack["seasonal"]
+            if len(si):
+                fig = go.Figure(go.Bar(x=MONTHS3, y=si.values, marker_color=acc,
+                                       text=[f"{v:.0f}" for v in si.values],
+                                       textposition="outside"))
+                fig.add_hline(y=100, line_dash="dash", line_color=INK)
+                fig.update_layout(title=f"Seasonal index (100 = average month) · from "
+                                        f"{', '.join(map(str, full))}")
+                st.plotly_chart(style_fig(fig, 300, acc), use_container_width=True)
+            else:
+                st.info("No complete calendar year in the sheet yet, so there's no seasonal "
+                        "profile to read.")
+            pj = pack["projection"]["ALL"]
+            if month < 12:
+                st.markdown("<div class='eyebrow'>Where the year lands</div>",
+                            unsafe_allow_html=True)
+                _cards([("Year to date", _n0(pj["ytd"]), "L", lab),
+                        ("Seasonal landing", _n0(pj["seasonal"]), "L",
+                         f"on {pj['ref']}'s profile" if pj["ref"] else "no complete year to use"),
+                        ("Run-rate landing", _n0(pj["runrate"]), "L", "flat daily rate × 365"),
+                        (f"Full year {year - 1}", _n0(pj["prior_fy"]), "L",
+                         dl(pj["seasonal"], pj["prior_fy"]) if np.isfinite(pj["prior_fy"]) else "")],
+                       acc)
+                mm = month_matrix(pack["monthly"], "ALL", pack["years"], year, month)
+                fig = go.Figure()
+                if year in mm.columns:
+                    fig.add_bar(x=MONTHS3, y=mm[year].values, name=f"{year} actual",
+                                marker_color=acc)
+                if not pj["outlook"].empty:
+                    fig.add_bar(x=[MONTHS3[m - 1] for m in pj["outlook"]["month"]],
+                                y=pj["outlook"]["projected"], name=f"{year} projected",
+                                marker=dict(color="rgba(58,110,165,.25)",
+                                            line=dict(color=acc, width=1.5)))
+                if have_b:
+                    full_prev = month_matrix(pack["monthly"], "ALL", pack["years"], -1, 12)
+                    fig.add_scatter(x=MONTHS3, y=full_prev[primary].values, name=str(primary),
+                                    mode="lines+markers", line=dict(color=YEAR_GREYS[1]))
+                fig.update_layout(barmode="overlay", title="Actual and projected litres by month")
+                st.plotly_chart(style_fig(fig, 340, acc), use_container_width=True)
+                st.caption("The seasonal landing scales this year's YTD by the share of the year "
+                           "the reference year had sold by the same month — it knows December "
+                           "isn't an ordinary month. It still assumes this year's pattern looks "
+                           "like that one's; treat it as a planning number, not a forecast.")
+
+        # ── Export ──
+        with tabs[7]:
+            stamp = datetime.now().strftime("%d %b %Y, %H:%M")
+            tag = f"{year}_{month:02d}"
+            meta = {"cover_sub": f"{CO} · {lab}" + (f" vs {clab}" if clab else "")
+                                 + f" · {int(A['stations'])} sites · generated {stamp}",
+                    "footer": f"Spartan Fuel Analytics · sheet {used_sheet} · GHS · confidential",
+                    "_buffer": io.BytesIO()}
+            st.markdown("<div class='eyebrow'>PDF · six pages</div>", unsafe_allow_html=True)
+            try:
+                st.download_button("⬇ Download year-end PDF", build_yearend_pdf(meta, pack),
+                                   f"spartan_year_end_{tag}.pdf", "application/pdf",
+                                   key="ye_pdf")
+            except Exception as e:
+                st.caption(f"PDF export unavailable ({e}).")
+            st.markdown("<div class='eyebrow'>Excel workbook · every table</div>",
+                        unsafe_allow_html=True)
+            st.download_button("⬇ Download year-end workbook", yearend_excel(pack),
+                               f"spartan_year_end_{tag}.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key="ye_xlsx")
+            st.markdown("<div class='eyebrow'>WhatsApp brief</div>", unsafe_allow_html=True)
+            wa = yearend_whatsapp(pack, stamp)
+            st.code(wa, language=None)
+            st.download_button("⬇ Download WhatsApp text", wa, f"spartan_year_end_{tag}.txt",
+                               "text/plain", key="ye_wa")
+
+
     # ═══════════════════════════ module dispatch ═══════════════════════════
     MODULES = {
         "⛽ Stocks & Sales": None,
+        "📅 Year-end review": render_yearend,
         "💰 Margins": render_margins,
         "🏷️ Pricing": render_pricing,
         "🚚 Supply": render_supply,

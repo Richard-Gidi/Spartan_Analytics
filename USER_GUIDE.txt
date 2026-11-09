@@ -1,0 +1,721 @@
+# Spartan OMC — User Guide
+
+**A working manual for the people who use the screens.**
+
+This is not the technical documentation. It walks through every module, every tab, every number on screen: what it is, how it is worked out, and what you should actually *do* about it.
+
+---
+
+## Contents
+
+1. [Before anything else: how to read this system](#1-before-anything-else-how-to-read-this-system)
+2. [Getting around](#2-getting-around)
+3. [The controls in the sidebar](#3-the-controls-in-the-sidebar)
+4. [⛽ Stocks & Sales](#4--stocks--sales)
+5. [💰 Margins](#5--margins)
+6. [🏷️ Pricing](#6-️-pricing)
+7. [🚚 Supply](#7--supply)
+8. [🛡️ Control](#8-️-control)
+9. [🏪 Site card](#9--site-card)
+10. [🏦 Banking](#10--banking)
+11. [⚙️ Settings](#11-️-settings)
+12. [Your daily, fortnightly and monthly routine](#12-your-daily-fortnightly-and-monthly-routine)
+13. [Every term, defined](#13-every-term-defined)
+14. [When a number looks wrong](#14-when-a-number-looks-wrong)
+
+---
+
+## 1. Before anything else: how to read this system
+
+### It only knows what the sheet tells it
+
+Every figure traces back to the daily station returns in the **MASTER** tab of your Google Sheet — date, station, price, discharge, sales, shortage, closing stock, dip, dip variance. If a site did not send a return on Tuesday, then for this system Tuesday did not happen at that site. It will not average over the gap or quietly fill it in.
+
+This is why **Control → Returns discipline** comes before you read anything else. A site that stops reporting drops out of every ranking, every target, every load plan — and it does so silently, looking merely small rather than missing.
+
+### Blank means "I don't know", not zero
+
+If a margin column is empty, it is because the ex-depot cost for that date has not been entered. The system will not estimate it. A blank you can chase is worth more than a plausible number you cannot defend, and this distinction runs through everything: an unknown price, an unrecorded dip, an unread floor all show as blank rather than as a guess.
+
+### Two different questions about the same litres
+
+Money appears in two places and they do not agree, deliberately:
+
+- **Stocks & Sales → 💸 Money** values missing litres at **pump price** — the revenue you never got to earn.
+- **Margins** values the same litres at **ex-depot cost** — the cash you actually spent on fuel that vanished.
+
+Both are true. The gap between them is the margin you would have made. Use the pump-price figure when arguing about lost sales; use the cost figure when writing off stock.
+
+### The grade colours
+
+Red is **PMS (petrol)**, green is **AGO (diesel)**, blue is combined. The colours are consistent everywhere, so a red bar always means petrol.
+
+---
+
+## 2. Getting around
+
+The **Module** selector sits at the top of the left sidebar. Eight modules:
+
+| Module | The question it answers | How often you open it |
+|---|---|---|
+| ⛽ **Stocks & Sales** | Are we selling enough, and is stock behaving? | Daily |
+| 💰 **Margins** | Are we making money, and where? | Monthly |
+| 🏷️ **Pricing** | Are we priced right and priced legally? | Every window (1st & 16th) |
+| 🚚 **Supply** | What goes on the road tomorrow? | Daily |
+| 🛡️ **Control** | Is anything leaking, and is everyone reporting? | Weekly |
+| 🏪 **Site card** | Everything about one station, one page | Before a dealer visit |
+| 🏦 **Banking** | Has the cash reached the bank? | Weekly |
+| ⚙️ **Settings** | The commercial numbers behind every cedi figure | Every window |
+
+Each module keeps its own date range and its own accent colour, so you always know where you are. Switching modules does not lose your place in the others.
+
+---
+
+## 3. The controls in the sidebar
+
+### Fuel grade (Stocks & Sales only)
+
+**PMS**, **AGO**, or **BOTH**. "BOTH" creates a synthetic combined product — litres are added together per station per day. Note that combined has **no price**, because adding a petrol price to a diesel price is meaningless. Anything price-driven is blank under BOTH; switch to a single grade for those.
+
+### Station focus
+
+**All stations** or one site. This changes the headline cards and summary; most tables still show the whole network so you keep the comparison.
+
+### Baseline period and Current period (Stocks & Sales)
+
+Two independent windows, and the difference between them is the whole target mechanism.
+
+- The **baseline** is the history the target is built from. The system takes each station's monthly totals across that span and finds the **median** month.
+- The **target** is that median **× 2**.
+- The **current period** is what gets measured against the target.
+
+Median rather than average is deliberate: one blowout month or one month with a three-week outage would drag an average around, while the median holds steady. It answers "what does this site do in a normal month?"
+
+Defaults are year-to-date up to last month for the baseline, and this month for the current period.
+
+### Period (all other modules)
+
+A single date range. Everything on the screen respects it.
+
+### ↻ Refresh data
+
+Data is cached for ten minutes. Press this after someone updates the sheet.
+
+---
+
+## 4. ⛽ Stocks & Sales
+
+Twelve tabs. This is the operational workbench.
+
+### The summary strip
+
+The grey band under the title is a written read of the current period: total litres against target, best and weakest site by attainment, and how many tanks are under about three days of cover. If you read one line, read this.
+
+### Tab 1 — Overview
+
+Four cards for the current selection:
+
+| Card | Meaning | What it tells you |
+|---|---|---|
+| **Actual sold (current)** | Litres in the current period | Raw throughput |
+| **Monthly target** | Median baseline month × 2 | The bar |
+| **Target obtained** | Actual ÷ target × 100 | The score |
+| **Median month** | The typical baseline month | Where the bar came from |
+
+A gauge shows percent of target obtained. **Status bands:** 100%+ is *on or above target*, 75–99% is *approaching*, below 75% is *below target*.
+
+**Reading it honestly:** if the current period is only ten days into the month, attainment will naturally be low. Percent-of-target is only meaningful at month end — mid-month, use **🔮 Forecast** instead, which projects the full month from the run rate.
+
+### Tab 2 — Targets vs Actual
+
+Per station: baseline months used, median month, monthly target, days recorded in the current period, actual sold, attainment %, and gap in litres.
+
+**Gap** is the number to act on — it is litres, not a percentage, so it tells you how much volume you actually need to find.
+
+Watch the **baseline months** column. A station with only one or two baseline months has a target built on very little; treat its attainment with suspicion until it has a few months of history.
+
+### Tab 3 — Price Sensitivity
+
+How customers at each site respond to price.
+
+**Elasticity** is computed by fitting log-volume against log-price. The number means: *for every 1% the price rises, volume changes by this many percent*. It is normally negative — price up, volume down.
+
+| Reading | Label | What it means for you |
+|---|---|---|
+| Below −1.1 | **Elastic** | Customers are price-shoppers. Raising price loses more volume than it gains in margin; cutting price can win real volume. |
+| −0.9 to −1.1 | **Unit-elastic** | Revenue stays about flat whichever way you move. |
+| Above −0.9 | **Inelastic** | Captive trade. You have room to hold or raise price without losing much. |
+| Positive | *(unusual)* | Volume rose with price — something else was driving sales: network growth, a competitor outage, seasonality. Don't read it as "raising price sells more fuel." |
+
+**Requirements:** at least four priced days and two distinct price points. Sites that never move price show "no price movement" — that is a data limitation, not a finding.
+
+**r²** tells you how tightly the relationship holds. A low r² with a dramatic elasticity is noise wearing a suit.
+
+**Price levels** shows average daily volume at each price the site has actually charged, and **price events** shows each price change with average volume for 14 days before and after, plus an arc elasticity for that specific move. Event evidence beats the fitted curve when the two disagree — it is a real before-and-after rather than a line through a cloud.
+
+The what-if calculator lets you set a price and see projected volume and revenue from the fitted relationship. It is an extrapolation; treat prices outside the site's historical range with real caution.
+
+### Tab 4 — Days to Run Out
+
+Stock cover per site.
+
+**Days of cover** = current stock ÷ average daily sales over the last 7 selling days.
+
+Stock is the **physical dip** where you have one, falling back to **book closing** where you don't. The table names which was used — a site running on book figures has an unverified number, and the gap between book and dip is exactly what Control is for.
+
+| Band | Days | Meaning |
+|---|---|---|
+| **Critical** | under 1.5 | Order today; you may already be too late |
+| **Low** | 1.5 – 3 | On tomorrow's load plan |
+| **Watch** | 3 – 6 | Plan it this week |
+| **Healthy** | 6+ | Fine |
+
+The seven-day average means a site that just had an unusually busy week will read as having *less* cover than it truly does, and vice versa. That bias is on the safe side.
+
+### Tab 5 — Efficiency
+
+How fast each site turns stock over.
+
+| Column | Meaning |
+|---|---|
+| **Avg daily sales** | Mean of selling days (zero days excluded) |
+| **Avg stock** | Typical stock held |
+| **Days to stockout** | Typical stock ÷ daily sales — how long a full tank lasts |
+| **Refill cycle** | Actual average days between deliveries |
+| **Turnover per day** | Fraction of the tank sold per day |
+| **Deliveries / refills per month** | Drop frequency |
+| **Stockout days** | Days recorded with zero sales |
+
+**The comparison that matters** is *days to stockout* against *refill cycle*. If a tank lasts 4 days and you deliver every 7, that site runs dry for 3 days in every cycle — and every dry day is volume walking to a competitor and, worse, a customer learning a new habit.
+
+High turnover is good for working capital but leaves no buffer. Low turnover means cash sitting in a tank.
+
+### Tab 6 — Variance
+
+Stock control, from the sheet's dip-variance columns.
+
+The standard is **±10 litres per day** per site per grade.
+
+**Two important mechanics:**
+
+- Any single day with a dip variance above **1,000 litres** is treated as an **unbooked delivery** — a drop that raised the dip but was never entered as a discharge — not as stock loss. Those days are excluded from the variance figures and counted separately in the **anomaly days** column. Without this, one missing delivery entry would swamp a month of genuine control data.
+- **Gains do not offset losses** in the loss figures. A positive variance is nearly always a booking error, not free fuel.
+
+| Column | Meaning |
+|---|---|
+| **Dip variance** | Total over the period, after excluding delivery days |
+| **Avg daily var** | Per-day average, judged against the ±10 L standard |
+| **Days over** | Days that individually breached the standard |
+| **Anomaly days** | Suspected unbooked deliveries |
+| **Allowable** | 10 L × days — the budget |
+| **Over by** | How far the daily average exceeds standard |
+| **Stock loss %** | Cumulative variance as a share of throughput |
+| **Delivery shortage** | Shortage recorded on arrival |
+
+**Stock loss %** is the fairest cross-site comparison, because a big site will always show bigger absolute litres.
+
+### Tab 7 — Rankings
+
+A composite score, min-max normalised across the network:
+
+- **40% target attainment** (capped at 200% so one runaway site doesn't distort the scale)
+- **35% total volume**
+- **25% discipline** (inverse of absolute stock loss %)
+
+The weights encode a judgement: hitting plan matters slightly more than raw size, and a site that sells well while leaking is not a good site. A high-volume, high-loss station will rank below a mid-volume, tight one — which is usually the right message to send to dealers.
+
+Separate volume and attainment ranks are shown alongside, so a site can see it is third on volume but ninth on plan.
+
+### Tab 8 — 🔮 Forecast
+
+Two forecasts.
+
+**Month-end projection** takes month-to-date volume, divides by days elapsed, multiplies by days in month.
+
+| Card | Meaning |
+|---|---|
+| **Month-to-date** | Litres so far |
+| **Projected month-end** | Run rate × days in month |
+| **Monthly target** | The bar |
+| **Projected attainment** | Will we make it? |
+
+The **shortfall** column is the litres you need to find. **This is the mid-month version of target attainment** and the honest way to answer "are we on track?" before the month closes.
+
+It assumes the rest of the month looks like the start of it. Early-month projections swing wildly on one big day — trust it more as the month fills in.
+
+**30-day daily forecast** fits a straight-line trend plus a day-of-week pattern, with a shaded 80% band. Day-of-week matters more than people expect on a forecourt; the band is the honest width of the guess, and it widens with how noisy that site's history is. Needs at least 14 selling days.
+
+### Tab 9 — 🚨 Alerts
+
+Every exception in one list, sorted by severity.
+
+| Alert | Trigger |
+|---|---|
+| **Stock-out** | Under 1.5 days cover (severity 1) or under 3 (severity 2) |
+| **Off target** | Projected month-end attainment below threshold |
+| **Dip variance** | Average daily variance beyond ±10 L/day |
+| **Anomaly** | Latest day is 3+ standard deviations from the 45-day norm |
+| **Unbanked cash** | Outstanding cash held at a site |
+
+An **Anomaly** is not necessarily bad — a 3σ *high* day might be a competitor's outage. It means "this is unusual, go and find out why."
+
+Alerts export to Excel for circulation.
+
+### Tab 10 — Trends
+
+Full daily history, monthly totals, and a **weekly volume heatmap** (day of week × week). The heatmap is where day-of-week patterns become obvious — which is what tells you whether a Friday promotion or a Sunday staffing change is worth it.
+
+### Tab 11 — 💸 Money
+
+What stock losses cost, at pump price.
+
+| Card | Meaning |
+|---|---|
+| **Litres lost** | Net negative variance this period |
+| **Cost this period** | Those litres × each site's latest pump price |
+| **Annualized loss** | Current daily loss rate × 365 |
+| **Unbanked cash now** | Sales not yet deposited |
+
+**Annualized** is the number that changes minds. "We lost 400 litres" sounds like nothing. "This is GHS 90,000 a year" starts a conversation. The table ranks sites by annualised leak so you know which one to fix first.
+
+Unbanked cash sits beside it because it is the other pool of money at risk, and the two are often the same underlying control problem.
+
+### Tab 12 — 📄 Report
+
+The monthly stakeholder pack. Pick a month; it covers the whole network regardless of the sidebar selection, and ranks every station on three pillars for PMS and AGO separately:
+
+1. **Target vs Actual realized**
+2. **Variance** — stock control
+3. **Efficiency** — sell-through
+
+Outputs a **PDF** with your logo and a **WhatsApp brief** written in plain language — a headline, a short key explaining what target, attainment, variance and sell-through mean, then a section per grade. Copy it and send it with the PDF.
+
+---
+
+## 5. 💰 Margins
+
+The commercial P&L. **Everything here depends on the ex-depot cost in Settings.** If it is missing you get a warning at the top and the money columns stay blank.
+
+### How a litre is built down
+
+| Line | How it's worked out |
+|---|---|
+| **Revenue** | Litres × pump price (price carried forward across gaps) |
+| **Cost of sales** | Litres × ex-depot cost in force that day |
+| **Gross margin** | Revenue − cost of sales |
+| **Dealer cost** | Litres × dealer margin |
+| **Site opex** | Litres × opex per litre |
+| **UPPF income** | Litres × UPPF recovery (zero unless you actually collect it) |
+| **Loss cost** | Missing litres × average unit cost |
+| **Contribution** | Gross − dealer − opex + UPPF − loss cost |
+
+Losses are charged at **cost**, not pump price — the cash you actually spent on fuel that disappeared. Conservative, and the right basis for a write-off.
+
+### Tab 1 — Overview
+
+Cards: **Volume sold**, **Revenue**, **Gross margin** (with GHS/L), **Contribution** (with GHS/L).
+
+The summary tells you what a litre left in the business and what share of gross margin stock losses ate. That share is the sharpest single control metric in the system — a site earning GHS 0.80/litre and losing 15% of it to shrinkage has a bigger problem than one earning GHS 0.60 cleanly.
+
+Two charts split contribution by grade, in cedis and per litre. **They often disagree, and that is the point:** diesel usually contributes more in total while petrol contributes more per litre, or the reverse. Total tells you where the money is; per litre tells you where the quality is.
+
+### Tab 2 — By station
+
+Full commercial table per grade, plus a ranked contribution chart. Columns run from litres and average price through to net per litre.
+
+**Read Net/L before Contribution.** A big site with thin unit margin and a small site with fat unit margin need completely different conversations.
+
+### Tab 3 — Waterfall
+
+One litre, built down: pump price, minus ex-depot, minus dealer margin, minus site opex, minus stock loss, equals what you keep.
+
+This is the chart to put in front of a dealer. It makes visible in one picture that the pump price is not the OMC's money, and it shows the dealer's own margin as a bar rather than an assertion.
+
+### Tab 4 — Monthly trend
+
+Gross margin in cedis as bars, unit margin in GHS/L as a line, per grade.
+
+**Watch them diverge.** Cedis rising while GHS/L falls means you bought volume by giving away margin. That can be a deliberate share strategy or an accident — the chart won't tell you which, but it will tell you it happened.
+
+### Tab 5 — Break-even
+
+Needs a monthly fixed cost per site in Settings.
+
+**Break-even litres** = monthly fixed cost ÷ contribution per litre. The chart shows run-rate volume as a percentage of that. Below 100% and the site does not cover its own overhead. Red below, green above, dashed line at 100.
+
+### Tab 6 — Working capital
+
+Litres in tanks valued at cost.
+
+| Card | Meaning |
+|---|---|
+| **Stock on hand** | Total litres |
+| **Value at cost** | Cash tied up in wet stock |
+| **Days of inventory** | Network cover |
+| **Sites dry-risk** | Under 2 days |
+
+This is cash that is not in the bank. Balance it against the dry-risk count: too little inventory costs sales, too much costs cash, and this tab is where you see both at once.
+
+---
+
+## 6. 🏷️ Pricing
+
+Organised around Ghana's fortnightly pricing windows — **1st to 15th**, and **16th to month end**.
+
+> **Published dates slip.** The first August 2026 window ran 4–15 August, not 1–15. Floors are looked up by the *effective date on the notice*, not by the convention. Where a floor changed mid-window, the window board shows the average of the floors actually in force across those days.
+
+### Tab 1 — Window board
+
+One row per window per grade.
+
+| Column | Meaning |
+|---|---|
+| **Avg / min / max price** | What we charged |
+| **NPA floor** | The published minimum |
+| **Headroom** | Our price − the floor. **Negative means we priced below the minimum.** |
+| **Ex-depot** | What we paid |
+| **Unit margin** | Price − ex-depot − dealer − opex + UPPF |
+| **Litres / L per day** | Volume (per-day figures compare fairly across windows of different length) |
+| **Price Δ / Volume Δ%** | Window-on-window movement |
+| **Elasticity** | Volume change ÷ price change, **only where price moved by at least 0.25%** — below that it divides into noise |
+
+### Tab 2 — Floor compliance
+
+Every site-day sold below the published minimum, with the shortfall per litre and the cedi **exposure** (shortfall × litres sold at that price).
+
+This tab is deliberately blunt. Selling under the floor is a licence matter before it is a margin matter, and exposure is the number a regulator would ask about first.
+
+If it says nothing to check, you have not entered floors for that grade.
+
+### Tab 3 — Network price spread
+
+Latest pump price at every site against the network median, with the spread in GHS/L.
+
+A wide spread is either deliberate territory pricing or a site quietly discounting. Both are worth knowing; only one is a decision.
+
+### Tab 4 — Price response
+
+Window-on-window price change plotted against volume change, each point labelled with its window, plus the median elasticity across windows.
+
+This is the network-level companion to per-site Price Sensitivity. Because it uses whole windows rather than daily noise, it is usually the more trustworthy of the two.
+
+### Tab 5 — Stock revaluation
+
+Every time the ex-depot cost moves, the litres already in your tanks are re-priced.
+
+- Cost **rises** → you hold stock bought cheaper → a real one-off **gain** (green).
+- Cost **falls** → you are carrying expensive stock into a cheaper market → a **loss** (red).
+
+The table shows the date, old and new cost, litres held on the day before, and the revaluation. **This is the value of loading ahead of a window, in cedis** — it turns a piece of trading instinct into a number you can check afterwards.
+
+---
+
+## 7. 🚚 Supply
+
+### Tab 1 — Load plan
+
+The core operational screen.
+
+| Column | Meaning |
+|---|---|
+| **Stock now** | Latest dip (or book closing) |
+| **Capacity / Tank %** | From the site register |
+| **Ullage** | Usable space = capacity × (1 − reserve) − stock |
+| **Avg daily** | Last 7 selling days |
+| **Days cover** | Stock ÷ daily rate |
+| **Reorder at** | (lead time + safety days) × daily rate |
+| **Order?** | True when stock has fallen to the reorder point |
+| **Suggested L** | Ullage, broken into real compartments |
+| **Compartments** | e.g. `34,000 + 16,000` |
+| **Order value** | At today's depot price |
+
+**Ullage reserve** (default 5%) is headroom you never plan into a load — for thermal expansion and dip error. Filling to the brim is how you create a spill.
+
+The **compartment plan** matters because BRVs come in fixed sizes. "Order 41,000 L" is not a thing you can do; `34,000` with the remainder left for next trip is. Anything below the **minimum economic drop** is deliberately not planned — it is not worth a truck.
+
+Sorted by days of cover, so the top row is the site closest to dry.
+
+### Tab 2 — Ullage & cover
+
+Tank fill per site: capacity as a grey bar, current stock overlaid, labelled with percent full.
+
+Scan for the pattern rather than the individual: several sites at 30% at once means your whole cycle is running late.
+
+### Tab 3 — Transit loss
+
+Shortage as a percentage of litres discharged, valued at cost.
+
+| Column | Meaning |
+|---|---|
+| **Drops / Discharged L / Avg drop** | Delivery activity |
+| **Shortage L / Loss %** | What went missing in transit |
+| **Short drops** | How many deliveries had a shortage |
+| **Days between drops** | Actual cycle |
+| **Cost** | Valued at ex-depot |
+
+**This is not a station loss.** It happens between depot and tank, so it is a claim against the transporter or the loading depot — never something to charge to the dealer. Keeping it in its own tab keeps that argument clean.
+
+**Short drops** matters as much as the percentage: one bad load is an incident, shortage on most loads is a route or a driver.
+
+### Tab 4 — Delivery log
+
+Every discharge in the period with the dip and book reading that followed. Your audit trail when a site disputes a delivery.
+
+---
+
+## 8. 🛡️ Control
+
+### Tab 1 — Wetstock control
+
+**The most important screen in the system, and the least obvious.**
+
+Pick a site and grade. You get cumulative dip variance plotted against a tolerance band that widens with throughput (default **0.5% of cumulative throughput**).
+
+Here is the logic that makes it work:
+
+> **Random measurement error wanders around zero. A leak, a mis-calibrated pump or a systematic short-delivery *trends*.**
+
+A site can sit inside the ±10 L/day daily standard every single day and still be losing steadily — because 8 litres a day, always negative, is 2,900 litres a year. The daily standard cannot see that. The cumulative line can.
+
+| Card | Meaning |
+|---|---|
+| **Cumulative variance** | Sum of daily differences |
+| **Tolerance band** | ±0.5% of throughput |
+| **Recent drift** | Average of the last 14 readings, in L/day |
+| **Verdict** | Plain-language conclusion |
+
+Verdicts:
+
+- **Within control** — wandering inside the band. Normal.
+- **Drifting negative** — 70%+ of the last 14 readings negative. Early warning; watch it.
+- **Leak or theft suspected** — broken the band downward. Investigate: tank integrity, pump calibration, delivery quantities, forecourt practice.
+- **Unexplained gain** — broken the band upward. Almost always deliveries reaching the tank without being booked.
+
+Below it, a **network summary** ranks every site-grade by cumulative variance so you can find the worst without clicking through each one.
+
+### Tab 2 — Returns discipline
+
+| Card | Meaning |
+|---|---|
+| **Network return rate** | Days submitted vs expected |
+| **Sites at 100%** | No missing days |
+| **Silent 3+ days** | No return recently |
+| **Missing days total** | Across the network |
+
+Bars are red under 90%, amber under 99%, green above. Sites silent three days or more are named explicitly.
+
+**Do this before you read the rankings.** A site that reports 60% of days looks 40% smaller than it is, and will sit unfairly at the bottom of every league table.
+
+### Tab 3 — Integrity flags
+
+Rows that should not occur in a clean book:
+
+| Flag | What it means |
+|---|---|
+| **Sales with no stock reading** | Volume sold, no dip or closing recorded |
+| **Unbooked delivery** | Dip variance beyond 1,000 L — a drop that wasn't entered |
+| **Delivery, no sales** | Product received, zero sales that day |
+| **Dip vs book gap** | Physical and book differ by more than 1,500 L |
+| **Large price step** | Price moved more than GHS 1.50 in one day |
+
+**These are questions, not accusations.** Most resolve as a delivery entered on the wrong day or a dip taken before the discharge settled. But every one of them is also what a genuine problem looks like on its first day, which is why they are worth a phone call each.
+
+### Tab 4 — Statutory volume return
+
+Opening dip, litres received, litres sold, closing dip — per site and product, for a chosen month, downloadable as Excel.
+
+Reconcile it here before it goes anywhere official. Opening and closing are **physical dips**, received is **booked discharge**, sold is **metered sales** — three independent measurements that should tell a consistent story.
+
+---
+
+## 9. 🏪 Site card
+
+One station, one page, for a dealer review or a territory visit.
+
+Top cards: **Volume**, **Contribution**, **Lowest cover** (whichever grade is closest to dry), **Stock loss cost**.
+
+Then per grade: litres, contribution per litre, days of cover, sell-through percentage, a written read in plain sentences, and daily volume with price overlaid. Finally the site's register entry — capacity, fixed cost, lead time, region, dealer.
+
+Built to be read aloud in a meeting. The written summary means you are not translating charts on your feet.
+
+---
+
+## 10. 🏦 Banking
+
+Cash generated against cash deposited. Unchanged from the earlier version and not extended.
+
+| Tab | Contents |
+|---|---|
+| **Overview** | Cash generated, deposited, % banked (gauge), outstanding; cash vs deposits by site |
+| **Reconciliation** | Outstanding unbanked cash per site, red for positive |
+| **By bank** | Deposits grouped by bank |
+| **Trend** | Cumulative cash vs deposits — the gap is unbanked; plus running balance for a single site |
+
+**Outstanding** is the running unbanked balance carried forward — cash generated but not yet in the bank. It is the number to chase.
+
+If the Value column is populated but deposits are not, you will see cash generated only, and the tab says so.
+
+---
+
+## 11. ⚙️ Settings
+
+**Every cedi figure in the system comes from here.** Nothing is assumed.
+
+### The banner at the top
+
+- **Green** — loaded, with the exact file path shown.
+- **Red** — no config found. Expand *Paths I looked in* to see every location tried.
+
+**If you run on Streamlit Community Cloud:** the file must be **committed to the repository**. Uploading it to a running app does nothing, and the container is rebuilt from git on every reboot. Alternatively paste the whole config into **Settings → Secrets** as `omc_config = '''{ ... }'''`.
+
+On a hosted deployment you will also see a warning that **Save writes a file that will vanish on reboot**. Edit here, press **⬇️ Download config**, and commit that file to your repo. **↻ Reload from disk** re-reads without restarting.
+
+### Tab 1 — Commercial model
+
+Per grade: **dealer margin**, **opex per litre**, **UPPF recovery**, then two dated tables side by side.
+
+**Ex-depot cost is built from two tables, not one:**
+
+- **Base price** — what the BDC charges per litre, before duties.
+- **Duties + levies** — the tax riding on it.
+
+They are kept apart because the base moves with **every lifting** while the tax moves when **policy moves**. Bundled into one number, a single levy change would force you to re-enter hundreds of prices. Split, it is one row.
+
+Both are **dated step tables**: the value in force on any day is the most recent entry on or before it. Add a row each time something changes; the date is the day it took effect. Before the first entry, the value is *unknown*, not zero.
+
+A **resolved ex-depot** preview shows base + tax for the most recent dates, so you can check the arithmetic.
+
+> **Opex per litre or monthly fixed cost — pick one.** If you carry site overhead as a fixed monthly figure in the Sites tab, leave opex per litre at zero, or you will charge it twice.
+
+### Tab 2 — Price floors
+
+The NPA minimum pump price per grade, dated from the day it takes effect.
+
+Three ways in, in descending order of how much you should trust them:
+
+1. **Fetch now** — reads npa.gov.gh directly. Works only if the site serves the figures in the page and does not block the request.
+2. **Paste the notice** — paste the text or page source; the same parser reads it. Works regardless of how the site is built. **This is the one to rely on.**
+3. **Type it** — thirty seconds, twice a month, never wrong.
+
+Whatever is read is **staged, not saved**. You see the parsed price and the exact text it matched, you set the effective date, then Apply, then Save. A parser reading a page never designed for machines will eventually pick up the wrong number, and a floor wrong by ten pesewas turns the compliance report into fiction while looking entirely normal. **Read the matched text before you apply it.**
+
+For bulk history, use the separate `extract_npa_floors.py` script on downloaded PDFs and merge the result.
+
+### Tab 3 — Sites
+
+The register. Tank capacity by grade, monthly fixed cost, lead time, safety stock days, region, dealer.
+
+| Field | What it drives |
+|---|---|
+| **PMS / AGO tank** | Ullage and order quantities |
+| **Fixed cost / month** | Break-even volume |
+| **Lead time (days)** | Reorder point |
+| **Safety stock (days)** | Reorder point |
+| **Region / Dealer** | Site card header |
+
+Station names must match the MASTER sheet **exactly** — matching is on the literal string, so `Abiram` and `ABIRAM` are two different sites.
+
+### Tab 4 — Logistics & control
+
+- **BRV compartment sizes** — comma separated, the sizes actually available to you.
+- **Minimum economic drop** — below this, don't send a truck.
+- **Ullage reserve %** — headroom never planned into a load.
+- **Wetstock tolerance %** — the control band. Tighter finds problems earlier and cries wolf more often.
+
+### Tab 5 — Company
+
+Name, NPA licence, supplying BDC. Optionally national monthly consumption volumes, which produce a market-share chart.
+
+### Tab 6 — Raw JSON
+
+The whole config as stored. Useful for copying into secrets or checking exactly what a table contains.
+
+### Saving
+
+**💾 Save settings** writes to disk. **⬇️ Download config** gives you the file. Changes apply to the session immediately; saving keeps them.
+
+---
+
+## 12. Your daily, fortnightly and monthly routine
+
+### Daily — about five minutes
+
+1. **Control → Returns discipline.** Chase anyone silent. Nothing else is reliable until this is clean.
+2. **Supply → Load plan.** Anything with *Order?* = True goes on tomorrow's schedule.
+3. **Stocks & Sales → 🚨 Alerts.** Work severity 1 first.
+
+### Every pricing window — the 1st and the 16th
+
+1. **Settings → Commercial model.** Enter the new ex-depot base price. Update tax only if policy moved.
+2. **Settings → Price floors.** Enter the new NPA minimum.
+3. **Pricing → Window board.** Check headroom and unit margin.
+4. **Pricing → Floor compliance.** Anything below the floor needs a same-day answer.
+5. **Pricing → Stock revaluation** — *before* deciding how hard to load ahead of the change.
+
+### Weekly
+
+1. **Control → Wetstock.** Any site whose cumulative line is trending away from zero.
+2. **Control → Integrity flags.** One phone call each.
+3. **Banking → Reconciliation.** Chase outstanding cash.
+
+### Monthly
+
+1. **Margins** — all six tabs. This is the real scorecard.
+2. **Control → Statutory volume return.** Reconcile before filing.
+3. **Stocks & Sales → 📄 Report.** Generate the PDF and WhatsApp brief.
+4. **Site card** for the two or three sites you are visiting.
+
+---
+
+## 13. Every term, defined
+
+| Term | Definition as this system computes it |
+|---|---|
+| **Attainment** | Actual litres ÷ monthly target × 100 |
+| **Monthly target** | Median of baseline monthly totals × 2 |
+| **Days of cover** | Latest dip (or book closing) ÷ average daily sales over the last 7 selling days |
+| **Reorder point** | (lead time days + safety days) × average daily sales |
+| **Ullage** | Tank capacity × (1 − ullage reserve) − current stock |
+| **Sell-through / turnover** | Average daily sales ÷ average stock held |
+| **Days to stockout** | Average stock ÷ average daily sales |
+| **Refill cycle** | Actual mean days between recorded discharges |
+| **Dip variance** | From the sheet's DV columns; single days above 1,000 L excluded as unbooked deliveries |
+| **Stock loss** | Net **negative** dip variance only — gains do not offset |
+| **Stock loss %** | Cumulative variance ÷ throughput |
+| **Wetstock tolerance** | Cumulative throughput × 0.5% |
+| **Ex-depot cost** | Base price + duties and levies, both dated step tables |
+| **Gross margin** | Revenue − cost of sales |
+| **Contribution** | Gross − dealer margin − site opex + UPPF − loss cost |
+| **Contribution per litre** | Contribution ÷ litres sold |
+| **Break-even litres** | Monthly fixed cost ÷ contribution per litre |
+| **Headroom** | Our average pump price − the NPA floor |
+| **Exposure** | Floor shortfall per litre × litres sold below it |
+| **Unit margin (window)** | Price − ex-depot − dealer − opex + UPPF |
+| **Elasticity** | % volume change per 1% price change |
+| **Transit loss** | Shortage ÷ litres discharged |
+| **Stock revaluation** | Litres held × change in ex-depot cost |
+| **Days of inventory** | Litres on hand ÷ average daily sales |
+| **Outstanding (banking)** | Running unbanked balance carried forward |
+
+---
+
+## 14. When a number looks wrong
+
+| What you see | Almost always because |
+|---|---|
+| Margin columns blank | No ex-depot cost entered for that date. Settings → Commercial model. |
+| Floor compliance says nothing to check | No floors entered for that grade. |
+| Ullage and order quantities blank | No tank capacity in the site register. |
+| Break-even blank | No monthly fixed cost for that site. |
+| A station appears twice | Its name is spelled two ways in the sheet. |
+| Attainment looks terrible mid-month | It is measuring a partial period. Use Forecast instead. |
+| Elasticity is blank | Fewer than four priced days, or the site never moved price. |
+| A huge one-day variance | Almost certainly a delivery not entered. Check Integrity flags. |
+| Price sensitivity is positive | Something other than price drove volume in that window. |
+| Compliance breaches across a stale period | A pricing window's floor is missing, so an older one carried forward. Check your floor coverage. |
+| Settings changes vanished after a restart | Hosted deployment with no persistent disk. Download the config and commit it. |
+| Config not picked up at all | Expand *Paths I looked in* on the Settings banner — it lists every location tried. |
+
+---
+
+*Nothing in this system is estimated. Where a figure is unknown it is left blank, because a blank you can chase is worth more than a number you cannot defend.*
