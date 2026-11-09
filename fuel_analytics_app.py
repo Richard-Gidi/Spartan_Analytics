@@ -1466,11 +1466,9 @@ def window_index(dmin, dmax):
 
 # ───────────────────────────── margin engine ───────────────────────────────
 # ─────────────────── ex-depot cost from the BDC sales book ─────────────────
-# Spartan lifts at the price the BDC charges JD-LINK, and that price is
-# already levy-inclusive: on every PMS day in the book it sits under the NPA
-# ex-pump floor by about an OMC-plus-dealer margin, and stacking the duties
-# table on top pushed it over the floor on 93% of days. So the book price IS
-# the ex-depot cost, and nothing is added to it.
+# Spartan lifts at the price the BDC charges JD-LINK. The book's Price column
+# is the EX-REFINERY price: taxes, levies and statutory margins (the dated
+# 'tax' table) ride on top of it to make the ex-depot cost.
 SALES_BOOK_OMC = os.getenv("SALES_BOOK_OMC", "JD-LINK")
 
 
@@ -2726,8 +2724,8 @@ def yearend_findings(pack):
             line += "."
         if A["gross_pl"] < 0:
             line += (" A negative gross margin means the cost on file sits above the pump "
-                     "price — check the ex-depot base isn't already levy-inclusive before "
-                     "the duties table is added on top.")
+                     "price — check the ex-refinery prices and the duties table for those "
+                     "dates.")
         F.append(line)
     elif A["vol_costed"]:
         F.append(f"Ex-depot cost covers only {A['cost_cov']:.0f}% of {lab} litres, so "
@@ -4474,10 +4472,10 @@ def main():
                 st.markdown(
                     "<span class='note'>Upload the BDC's sales workbook (the one with the "
                     "<b>Sales</b> sheet). Spartan's cost is whatever the BDC charged the named "
-                    "customer each day, litre-weighted where it lifted at more than one price. "
-                    "That price is levy-inclusive, so the duties table is cleared — adding it "
-                    "again counts the levies twice. Nothing is written until you press "
-                    "Apply.</span>", unsafe_allow_html=True)
+                    "customer each day (the ex-refinery price), litre-weighted where it lifted "
+                    "at more than one price. The duties + levies table below is added on top "
+                    "to give ex-depot cost and is not touched by the import. Nothing is "
+                    "written until you press Apply.</span>", unsafe_allow_html=True)
                 bc1, bc2 = st.columns([2, 1])
                 book = bc1.file_uploader("Sales book (.xlsx)", type=["xlsx", "xlsm"],
                                          key="bookup")
@@ -4520,16 +4518,11 @@ def main():
                                          .style.format({"Weighted": "{:,.4f}", "Low": "{:,.2f}",
                                                         "High": "{:,.2f}", "Litres": "{:,.0f}"}),
                                          use_container_width=True, hide_index=True)
-                        clear_tax = st.checkbox("Clear the duties + levies table for PMS and AGO "
-                                                "(book price already includes them)", value=True,
-                                                key="bookcleartax")
                         if st.button("✓ Apply to the commercial model", key="bookapply"):
                             for g, t in tbls.items():
                                 ec_ = cfg["economics"].setdefault(g, {})
                                 ec_["exdepot_base"] = t
-                                if clear_tax:
-                                    ec_["tax"] = {}
-                                for k in (f"exdepot_base_{g}", f"tax_{g}"):
+                                for k in (f"exdepot_base_{g}",):
                                     st.session_state.pop(k, None)
                             st.session_state["omc_cfg"] = cfg
                             st.toast("Ex-depot cost applied. Press 💾 Save settings — or on the "
